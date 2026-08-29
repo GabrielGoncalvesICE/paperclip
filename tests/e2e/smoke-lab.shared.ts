@@ -1,5 +1,5 @@
 import { expect, test, type APIRequestContext, type Page } from "@playwright/test";
-import { type SmokeLabLifecycleTool, type SmokeLabScenario, type SmokeRunStepPath } from "./smoke-lab.catalog";
+import { ciSmokeLabScenarios, type SmokeLabLifecycleTool, type SmokeLabScenario, type SmokeRunStepPath } from "./smoke-lab.catalog";
 
 type SmokeRunStepStatus = "pass" | "fail" | "skipped";
 
@@ -104,7 +104,7 @@ async function updateSmokeRun(
   request: APIRequestContext,
   companyId: string,
   runId: string,
-  status: "passed" | "failed",
+  status: "passed" | "failed" | "cancelled",
   summary: Json,
 ) {
   await json(await request.patch(`/api/companies/${companyId}/smoke-lab/runs/${runId}`, {
@@ -318,6 +318,7 @@ export const defineSmokeLabSuite = (label: string, scenarios: SmokeLabScenario[]
     await enableSmokeLab(request);
     const smokeRun = await createSmokeRun(request, seed.companyId, scenarios.length);
     const failed: string[] = [];
+    const isPartialRun = scenarios.length < ciSmokeLabScenarios.length;
 
     try {
       await startSmokeLabServices(request, seed.companyId);
@@ -442,9 +443,11 @@ export const defineSmokeLabSuite = (label: string, scenarios: SmokeLabScenario[]
       failed.push(error instanceof Error ? error.message : String(error));
       throw error;
     } finally {
-      await updateSmokeRun(request, seed.companyId, smokeRun.id, failed.length > 0 ? "failed" : "passed", {
+      await updateSmokeRun(request, seed.companyId, smokeRun.id, failed.length > 0 ? "failed" : isPartialRun ? "cancelled" : "passed", {
         catalog: "tests/e2e/smoke-lab.catalog.ts",
         scenarioCount: scenarios.length,
+        catalogScenarioCount: ciSmokeLabScenarios.length,
+        partial: isPartialRun,
         failed,
       }).catch(() => undefined);
     }
@@ -455,7 +458,7 @@ export const defineSmokeLabSuite = (label: string, scenarios: SmokeLabScenario[]
     }>(
       await request.get(`/api/companies/${seed.companyId}/smoke-lab/runs/${smokeRun.id}`),
     );
-    expect(completed.run.status).toBe("passed");
+    expect(completed.run.status).toBe(isPartialRun ? "cancelled" : "passed");
     for (const scenario of scenarios) {
       const steps = completed.steps.filter((step) => step.path === scenario.path);
       expect(steps.length, `${scenario.path} should record lifecycle steps`).toBeGreaterThanOrEqual(8);
