@@ -44,9 +44,9 @@ export const DEFAULT_CODEX_ACPX_RUNTIME_SHUTDOWN_BOUND_MS =
   PROVIDER_KILL_EXIT_TIMEOUT_MS +
   PROVIDER_SHUTDOWN_SCHEDULING_MARGIN_MS;
 // A close may outlive its caller-facing wait bound. Keep every exact attempt
-// owned until it settles even after the port releases it for a bounded retry.
-// This prevents abandoned protocol work from being garbage-collected without
-// letting one permanently pending attempt block all future recovery.
+// owned until it settles. A handle never starts a second protocol close while
+// the first remains unresolved; late failure can start bounded reconciliation
+// only after the exact attempt reaches a terminal outcome.
 const activeRuntimeCleanupOwners = new Set<Promise<unknown>>();
 const activeCodexRuntimeCleanupOwners = new Set<Promise<unknown>>();
 const SESSION_HANDSHAKE_TIMEOUT_MS = 8_000;
@@ -281,6 +281,7 @@ export async function openCodexAcpxRuntime(
     }),
   );
   let handle: AcpRuntimeHandle | null = null;
+  let lateCleanup: Promise<void> | null = null;
   try {
     const boundedHandshake = boundedSessionHandshake(
       handshake,
@@ -298,7 +299,7 @@ export async function openCodexAcpxRuntime(
   } catch (error) {
     const aborted = options.signal?.aborted === true;
     if (aborted || error instanceof AcpxSessionHandshakeTimeoutError) {
-      const lateCleanup = lateHandshakeCleanup(
+      lateCleanup = lateHandshakeCleanup(
         handshake,
         admissionCleanup,
         aborted
@@ -315,6 +316,16 @@ export async function openCodexAcpxRuntime(
       cleanupHandle,
       cleanupReason,
     );
+    const retainedCleanup =
+      cleanupErrors.length === 0
+        ? Promise.resolve()
+        : admissionCleanup.runRetained(cleanupHandle, cleanupReason);
+    const cleanupProof =
+      lateCleanup === null
+        ? retainedCleanup
+        : Promise.all([retainedCleanup, lateCleanup]).then(() => undefined);
+    options.retainFailedAdmissionCleanup(cleanupProof);
+    retainCleanup(cleanupProof);
     if (cleanupErrors.length > 0) {
       retainCleanup(admissionCleanup.runRetained(cleanupHandle, cleanupReason));
       throw new AggregateError(
@@ -341,6 +352,12 @@ export async function openCodexAcpxRuntime(
   } catch (error) {
     const cleanupReason = "ACPX runtime identity validation failed";
     const cleanupErrors = await admissionCleanup.run(handle, cleanupReason);
+    const cleanupProof =
+      cleanupErrors.length === 0
+        ? Promise.resolve()
+        : admissionCleanup.runRetained(handle, cleanupReason);
+    options.retainFailedAdmissionCleanup(cleanupProof);
+    retainCleanup(cleanupProof);
     if (cleanupErrors.length > 0) {
       retainCleanup(admissionCleanup.runRetained(handle, cleanupReason));
       throw new AggregateError(
@@ -798,12 +815,27 @@ function runtimePort(
     retainRuntimeCleanupOwner(owner);
   };
 
-  const watchReleasedAttempt = (attempt: Promise<unknown | null>): void => {
+  const watchPendingAttempt = (
+    attempt: Promise<unknown | null>,
+    processCleanupSucceeded: boolean,
+    reconciliationGeneration: number,
+  ): void => {
     if (watchedReleasedAttempts.has(attempt)) return;
     watchedReleasedAttempts.add(attempt);
     void attempt.then((error) => {
       watchedReleasedAttempts.delete(attempt);
-      if (error === null) return;
+      if (runtimeCloseAttempt === attempt) runtimeCloseAttempt = undefined;
+      if (error === null) {
+        if (processCleanupSucceeded) {
+          reconciledLateFailureGeneration = Math.max(
+            reconciledLateFailureGeneration,
+            reconciliationGeneration,
+          );
+          runtimeClosed = !hasUnreconciledLateFailure();
+        }
+        scheduleLateFailureReconciliation();
+        return;
+      }
       // A newer successful close cannot erase an older outcome that had not
       // settled yet. Re-open cleanup state and autonomously create a bounded
       // reconciliation generation so the late failure is not suppression-only.
@@ -835,17 +867,19 @@ function runtimePort(
       runtimeCloseTimeoutMs,
     );
     // The caller may stop waiting, but the exact ACPX protocol cleanup stays
-    // owned until it settles. Provider termination proceeds at the deadline;
-    // after this bounded observation finishes a later close may make a fresh
-    // protocol attempt instead of inheriting a permanently pending promise.
+    // owned and remains this handle's sole close attempt until it settles.
+    // Provider termination still proceeds at the deadline.
     const [closeError, processErrors] = await Promise.all([
       boundedCloseOutcome(observedAttempt, runtimeCloseTimeoutMs),
       processCleanup,
     ]);
     if (closeError instanceof AcpxRuntimeCloseTimeoutError) {
-      watchReleasedAttempt(observedAttempt);
-    }
-    if (runtimeCloseAttempt === observedAttempt) {
+      watchPendingAttempt(
+        observedAttempt,
+        processErrors.length === 0,
+        observedReconciliationGeneration,
+      );
+    } else if (runtimeCloseAttempt === observedAttempt) {
       runtimeCloseAttempt = undefined;
     }
     if (processErrors.length === 0 && closeError === null) {

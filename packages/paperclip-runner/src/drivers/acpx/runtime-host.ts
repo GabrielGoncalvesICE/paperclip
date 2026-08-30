@@ -105,6 +105,11 @@ export interface AcpxRuntimePortOpenOptions {
   /** Abort provider admission and clean any runtime that resolves too late. */
   signal?: AbortSignal;
   mcpServers: readonly AcpxMcpServerBinding[];
+  /**
+   * Transfer the provider cleanup proof before a failed open settles. The host
+   * keeps credentials fenced until this exact cleanup succeeds.
+   */
+  retainFailedAdmissionCleanup(cleanup: Promise<void>): void;
 }
 
 export interface AcpxMcpServerBinding {
@@ -151,12 +156,19 @@ export interface OpenAcpxRuntimeHostOptions {
   semanticTools?: AcpxSemanticToolSession;
 }
 
-// An aborted runtime admission that rejects with anything other than the exact
-// abort reason has not proved that its provider was reaped. Keep the managed
-// credential lease fenced for this process rather than letting a still-live
-// provider race a replacement owner in the same home.
-const quarantinedAbortedRuntimeCredentials =
-  new Set<ManagedCodexCredentialLease>();
+const activeRuntimeHostCleanupOwners = new Set<Promise<unknown>>();
+
+interface RetainedRejectedRuntimeAdmission {
+  readonly credential: ManagedCodexCredentialLease;
+  cleanup: Promise<void>;
+}
+
+// A rejected provider open is not itself proof that provider processes are
+// gone. Retain the credential with the adapter's exact cleanup proof and scrub
+// it only after that proof succeeds. Terminal cleanup failure stays inert and
+// fenced instead of exposing the credential to a replacement admission.
+const retainedRejectedRuntimeAdmissions =
+  new Set<RetainedRejectedRuntimeAdmission>();
 
 interface RetainedAcpxAdmissionCleanup {
   readonly runtime: AcpxRuntimePort | null;
@@ -253,6 +265,36 @@ export class AcpxRuntimeHost {
     const admissionCleanupTimeoutMs =
       dependencies.admissionCleanupTimeoutMs ??
       RUNTIME_ADMISSION_VERIFICATION_TIMEOUT_MS;
+    let failedAdmissionCleanupTransferred = false;
+    let resolveFailedAdmissionCleanupTransfer!: () => void;
+    const failedAdmissionCleanupTransfer = new Promise<void>((resolve) => {
+      resolveFailedAdmissionCleanupTransfer = resolve;
+    });
+    const retainFailedAdmissionCleanup = (cleanup: Promise<void>): void => {
+      if (failedAdmissionCleanupTransferred) return;
+      failedAdmissionCleanupTransferred = true;
+      pendingRuntimeOwnsCredential = credential !== null;
+      resolveFailedAdmissionCleanupTransfer();
+      if (credential === null) {
+        retainRuntimeHostCleanup(cleanup);
+        return;
+      }
+      const retained: RetainedRejectedRuntimeAdmission = {
+        credential,
+        cleanup: Promise.resolve(),
+      };
+      const ownedCleanup = cleanup.then(async () => {
+        await cleanupAbortedRuntimeAdmission(
+          null,
+          retained.credential,
+          "ACPX rejected runtime admission cleanup confirmed",
+        );
+        retainedRejectedRuntimeAdmissions.delete(retained);
+      });
+      retained.cleanup = ownedCleanup;
+      retainedRejectedRuntimeAdmissions.add(retained);
+      retainRuntimeHostCleanup(ownedCleanup);
+    };
     try {
       const sandbox = await runAbortableAdmissionStage(options.signal, () =>
         prepareAcpxRuntimeSandbox({
@@ -316,6 +358,7 @@ export class AcpxRuntimeHost {
                   },
                 ]
               : [],
+            retainFailedAdmissionCleanup,
           }),
         releaseLate: (lateRuntime) =>
           lateRuntime.close({
@@ -330,8 +373,8 @@ export class AcpxRuntimeHost {
           retainAbortedRuntimeAdmissionCleanup({
             pendingRuntime,
             credential,
-            abortReason: options.signal?.reason,
             reason: "ACPX runtime admission aborted",
+            failedAdmissionCleanupTransfer,
           });
         },
       });
@@ -589,24 +632,13 @@ function raceAdmissionWithAbort<T>(
 function retainAbortedRuntimeAdmissionCleanup(input: {
   pendingRuntime: Promise<AcpxRuntimePort>;
   credential: ManagedCodexCredentialLease | null;
-  abortReason: unknown;
   reason: string;
+  failedAdmissionCleanupTransfer: Promise<void>;
 }): void {
   const cleanup = input.pendingRuntime.then(
     (runtime) =>
       cleanupAbortedRuntimeAdmission(runtime, input.credential, input.reason),
-    (error: unknown) => {
-      if (error === input.abortReason) {
-        return cleanupAbortedRuntimeAdmission(
-          null,
-          input.credential,
-          input.reason,
-        );
-      }
-      if (input.credential) {
-        quarantinedAbortedRuntimeCredentials.add(input.credential);
-      }
-    },
+    () => input.failedAdmissionCleanupTransfer,
   );
   retainRuntimeHostCleanup(cleanup);
 }
