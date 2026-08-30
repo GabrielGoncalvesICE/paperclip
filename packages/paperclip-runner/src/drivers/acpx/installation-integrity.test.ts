@@ -1247,22 +1247,30 @@ describe("ACPX installation integrity", () => {
         expect(processAlive(providerPid)).toBe(true);
 
         process.kill(guardianPid, "SIGSTOP");
-        owner.kill("SIGKILL");
-        await once(owner, "exit");
-        // The stopped sentinel cannot answer any application protocol. Its
-        // two inherited quorum listeners nevertheless prevent a second owner.
-        await expect(
-          stageManagedCodexCredential({
-            agentHomeDirectory: credentialHome,
-            environment: {
-              PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: '{"owner":"contender"}',
-            },
-          }),
-        ).rejects.toThrow("already has an active lease");
-        expect(processAlive(providerPid)).toBe(true);
-
-        process.kill(guardianPid, "SIGCONT");
-        await waitUntil(() => !processAlive(providerPid));
+        try {
+          owner.kill("SIGKILL");
+          await once(owner, "exit");
+          // The stopped sentinel cannot answer any application protocol. Its
+          // two inherited quorum listeners nevertheless prevent a second owner.
+          await expect(
+            stageManagedCodexCredential({
+              agentHomeDirectory: credentialHome,
+              environment: {
+                PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: '{"owner":"contender"}',
+              },
+            }),
+          ).rejects.toThrow("already has an active lease");
+          expect(processAlive(providerPid)).toBe(true);
+        } finally {
+          if (owner.exitCode === null && owner.signalCode === null) {
+            owner.kill("SIGKILL");
+            await once(owner, "exit").catch(() => undefined);
+          }
+          // SIGSTOP pins this exact live guardian PID against reuse until the
+          // matching resume. Owner-pipe EOF then makes it self-reap its group.
+          process.kill(guardianPid, "SIGCONT");
+          await waitUntil(() => !processAlive(providerPid));
+        }
         let contender: Awaited<
           ReturnType<typeof stageManagedCodexCredential>
         > | null = null;
@@ -1341,22 +1349,30 @@ describe("ACPX installation integrity", () => {
         // provider's inherited quorum must still reject a competing owner, and
         // guardian-pipe EOF must reap it as soon as it can run again.
         process.kill(providerPid, "SIGSTOP");
-        process.kill(guardianPid, "SIGKILL");
-        owner.kill("SIGKILL");
-        await once(owner, "exit");
-        // The provider's inherited quorum remains authoritative whether the
-        // dead guardian is still observable as a zombie or has been reaped.
-        await expect(
-          stageManagedCodexCredential({
-            agentHomeDirectory: credentialHome,
-            environment: {
-              PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: '{"owner":"contender"}',
-            },
-          }),
-        ).rejects.toThrow("already has an active lease");
-
-        process.kill(providerPid, "SIGCONT");
-        await waitUntil(() => !processAlive(providerPid));
+        try {
+          process.kill(guardianPid, "SIGKILL");
+          owner.kill("SIGKILL");
+          await once(owner, "exit");
+          // The provider's inherited quorum remains authoritative whether the
+          // dead guardian is still observable as a zombie or has been reaped.
+          await expect(
+            stageManagedCodexCredential({
+              agentHomeDirectory: credentialHome,
+              environment: {
+                PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: '{"owner":"contender"}',
+              },
+            }),
+          ).rejects.toThrow("already has an active lease");
+        } finally {
+          if (owner.exitCode === null && owner.signalCode === null) {
+            owner.kill("SIGKILL");
+            await once(owner, "exit").catch(() => undefined);
+          }
+          // The stopped provider PID cannot be reused before this matching
+          // resume; guardian-pipe EOF then reaps that exact live process.
+          process.kill(providerPid, "SIGCONT");
+          await waitUntil(() => !processAlive(providerPid));
+        }
         const contender = await stageManagedCodexCredential({
           agentHomeDirectory: credentialHome,
           environment: {
