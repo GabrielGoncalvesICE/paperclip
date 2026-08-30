@@ -1271,6 +1271,7 @@ describe("managed Codex credentials", () => {
         globalThis as typeof globalThis & {
           __paperclipDirectorySyncHelperRegistryV1?: {
             activeChildren: Set<ChildProcess>;
+            childDirectories: Map<ChildProcess, string>;
             activeParentOperations: Set<symbol>;
             failedHomes: Set<string>;
             stuckChildren: Map<string, ChildProcess>;
@@ -1296,8 +1297,11 @@ describe("managed Codex credentials", () => {
         }) as unknown as ChildProcess;
         const directory = `/departed-credential-helper-${String(index)}`;
         registry!.activeChildren.add(child);
-        registry!.failedHomes.add(directory);
-        registry!.stuckChildren.set(directory, child);
+        registry!.childDirectories.set(child, directory);
+        if (index < 2) {
+          registry!.failedHomes.add(directory);
+          registry!.stuckChildren.set(directory, child);
+        }
         return { child, directory };
       });
       const killSpy = vi
@@ -1342,6 +1346,7 @@ describe("managed Codex credentials", () => {
         expect(observedActiveChildren.every((count) => count < 4)).toBe(true);
         for (const { child, directory } of departedHelpers) {
           expect(registry!.activeChildren).not.toContain(child);
+          expect(registry!.childDirectories.has(child)).toBe(false);
           expect(registry!.failedHomes).not.toContain(directory);
           expect(registry!.stuckChildren.has(directory)).toBe(false);
         }
@@ -1352,6 +1357,7 @@ describe("managed Codex credentials", () => {
         }
         for (const { child, directory } of departedHelpers) {
           registry!.activeChildren.delete(child);
+          registry!.childDirectories.delete(child);
           registry!.failedHomes.delete(directory);
           registry!.stuckChildren.delete(directory);
         }

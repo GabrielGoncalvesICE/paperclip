@@ -62,6 +62,7 @@ type CredentialLeaseGeneration = number;
 
 interface DirectorySyncHelperRegistry {
   activeChildren: Set<ChildProcess>;
+  childDirectories: Map<ChildProcess, string>;
   activeParentOperations: Set<symbol>;
   attempts: Map<string, Promise<void>>;
   failedHomes: Set<string>;
@@ -80,6 +81,7 @@ const processDirectorySyncHelperState = globalThis as typeof globalThis & {
 const directorySyncHelperRegistry =
   processDirectorySyncHelperState.__paperclipDirectorySyncHelperRegistryV1 ?? {
     activeChildren: new Set<ChildProcess>(),
+    childDirectories: new Map<ChildProcess, string>(),
     activeParentOperations: new Set<symbol>(),
     attempts: new Map<string, Promise<void>>(),
     failedHomes: new Set<string>(),
@@ -96,6 +98,8 @@ const isolatedDirectorySyncAttempts = directorySyncHelperRegistry.attempts;
 const failedIsolatedDirectorySyncHomes =
   directorySyncHelperRegistry.failedHomes;
 const stuckDirectorySyncHelpers = directorySyncHelperRegistry.stuckChildren;
+const directorySyncHelperDirectories =
+  directorySyncHelperRegistry.childDirectories;
 const activeCredentialLeaseGenerations = new Map<
   string,
   CredentialLeaseGeneration
@@ -1028,6 +1032,7 @@ async function runDirectorySyncHelper(directory: string): Promise<void> {
       },
     );
     directorySyncHelperRegistry.activeChildren.add(child);
+    directorySyncHelperDirectories.set(child, directory);
     child.unref();
   } catch (error) {
     throw new Error(
@@ -1055,6 +1060,7 @@ async function runDirectorySyncHelper(directory: string): Promise<void> {
       if (reaped) return;
       reaped = true;
       directorySyncHelperRegistry.activeChildren.delete(child);
+      directorySyncHelperDirectories.delete(child);
       if (stuckDirectorySyncHelpers.get(directory) === child) {
         stuckDirectorySyncHelpers.delete(directory);
         failedIsolatedDirectorySyncHomes.delete(directory);
@@ -1125,7 +1131,7 @@ async function runDirectorySyncHelper(directory: string): Promise<void> {
 }
 
 function reclaimConfirmedExitedDirectorySyncHelpers(): void {
-  for (const [directory, child] of stuckDirectorySyncHelpers) {
+  for (const child of directorySyncHelperRegistry.activeChildren) {
     let exited =
       (child.exitCode !== null && child.exitCode !== undefined) ||
       (child.signalCode !== null && child.signalCode !== undefined);
@@ -1142,7 +1148,11 @@ function reclaimConfirmedExitedDirectorySyncHelpers(): void {
     }
     if (!exited) continue;
     directorySyncHelperRegistry.activeChildren.delete(child);
-    if (stuckDirectorySyncHelpers.get(directory) === child) {
+    const directory =
+      directorySyncHelperDirectories.get(child) ??
+      [...stuckDirectorySyncHelpers].find(([, owner]) => owner === child)?.[0];
+    directorySyncHelperDirectories.delete(child);
+    if (directory && stuckDirectorySyncHelpers.get(directory) === child) {
       stuckDirectorySyncHelpers.delete(directory);
       failedIsolatedDirectorySyncHomes.delete(directory);
     }
