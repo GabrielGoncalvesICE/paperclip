@@ -294,7 +294,7 @@ describe("Codex ACPX runtime adapter", () => {
         },
         { signal: new AbortController().signal },
       ),
-    ).resolves.toEqual({ outcome: "allow_once" });
+    ).resolves.toEqual({ outcome: "reject_once" });
     await expect(
       runtimeOptions?.onPermissionRequest?.(
         {
