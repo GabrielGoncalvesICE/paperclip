@@ -59,6 +59,12 @@ export interface AcpxRuntimePortOpenOptions {
   signal?: AbortSignal;
 }
 
+export interface AcpxRetainedCleanupFailure {
+  resource: "credential" | "command" | "runtime";
+  attempt: number;
+  error: unknown;
+}
+
 export interface AcpxRuntimeHostDependencies {
   verifyInstallation?: (
     profile: QualifiedAcpxProfile,
@@ -66,6 +72,11 @@ export interface AcpxRuntimeHostDependencies {
   /** Internal test seam for aborting credential acquisition. */
   stageCredential?: typeof stageManagedCodexCredential;
   openRuntime(options: AcpxRuntimePortOpenOptions): Promise<AcpxRuntimePort>;
+  /**
+   * Required observability channel for resources acquired after admission was
+   * aborted. Implementations must not throw from this callback.
+   */
+  reportRetainedCleanupFailure(failure: AcpxRetainedCleanupFailure): void;
 }
 
 export interface OpenAcpxRuntimeHostOptions {
@@ -84,6 +95,8 @@ export interface OpenAcpxRuntimeHostOptions {
 }
 
 const activeRuntimeHostCleanupOwners = new Set<Promise<unknown>>();
+const RETAINED_CLEANUP_RETRY_INITIAL_DELAY_MS = 10;
+const RETAINED_CLEANUP_RETRY_MAX_DELAY_MS = 1_000;
 
 export class AcpxRuntimeHost {
   readonly #runtime: AcpxRuntimePort;
@@ -116,9 +129,8 @@ export class AcpxRuntimeHost {
   ): Promise<AcpxRuntimeHost> {
     options.signal?.throwIfAborted();
     const profile = resolveQualifiedAcpxProfile(options.agent, options.model);
-    const binding = await runAbortableAdmissionStage(
-      options.signal,
-      () => createAcpxRecoveryBinding({
+    const binding = await runAbortableAdmissionStage(options.signal, () =>
+      createAcpxRecoveryBinding({
         runtimeDirectory: options.runtimeDirectory,
         normalizedSessionId: options.normalizedSessionId,
         workingDirectory: options.workingDirectory,
@@ -139,11 +151,10 @@ export class AcpxRuntimeHost {
       );
     }
 
-    const installation = await runAbortableAdmissionStage(
-      options.signal,
-      () => (
-        dependencies.verifyInstallation ?? verifyQualifiedAcpxInstallation
-      )(profile),
+    const installation = await runAbortableAdmissionStage(options.signal, () =>
+      (dependencies.verifyInstallation ?? verifyQualifiedAcpxInstallation)(
+        profile,
+      ),
     );
     if (installation.commandDigest !== profile.commandDigest) {
       throw new Error("Verified ACPX installation does not match its profile");
@@ -152,9 +163,8 @@ export class AcpxRuntimeHost {
     let credential: ManagedCodexCredentialLease | null = null;
     let runtime: AcpxRuntimePort | null = null;
     try {
-      const sandbox = await runAbortableAdmissionStage(
-        options.signal,
-        () => prepareAcpxRuntimeSandbox({
+      const sandbox = await runAbortableAdmissionStage(options.signal, () =>
+        prepareAcpxRuntimeSandbox({
           binding,
           agent: options.agent,
           environment: options.environment,
@@ -163,42 +173,53 @@ export class AcpxRuntimeHost {
       if (options.agent === "codex") {
         credential = await acquireAbortableAdmissionResource({
           signal: options.signal,
-          acquire: () => (
-            dependencies.stageCredential ?? stageManagedCodexCredential
-          )({
-            agentHomeDirectory: sandbox.agentHomeDirectory,
-            environment: options.environment,
-            sourcePath: options.managedCodexCredentialSourcePath,
-          }),
+          acquire: () =>
+            (dependencies.stageCredential ?? stageManagedCodexCredential)({
+              agentHomeDirectory: sandbox.agentHomeDirectory,
+              environment: options.environment,
+              sourcePath: options.managedCodexCredentialSourcePath,
+            }),
+          resource: "credential",
           releaseLate: (lateCredential) => lateCredential.close(),
+          reportFailure: (failure) =>
+            dependencies.reportRetainedCleanupFailure(failure),
         });
       }
       command = await acquireAbortableAdmissionResource({
         signal: options.signal,
         acquire: () => installation.openCommand(),
+        resource: "command",
         releaseLate: (lateCommand) => lateCommand.close(),
+        reportFailure: (failure) =>
+          dependencies.reportRetainedCleanupFailure(failure),
       });
       runtime = await acquireAbortableAdmissionResource({
         signal: options.signal,
-        acquire: () => dependencies.openRuntime({
-          command: command!,
-          profile,
-          cwd: binding.workspacePath,
-          stateDirectory: sandbox.stateDirectory,
-          providerSessionKey: binding.profileSessionKey,
-          permissionMode: binding.permissionMode,
-          permissionPolicy: acpxRuntimePermissionPolicy(binding.permissionMode),
-          launchEnvironment: sandbox.launchEnvironment,
-          systemInstructions: boundedInstructions(options.systemInstructions),
-          ...(options.signal === undefined ? {} : { signal: options.signal }),
-        }),
-        releaseLate: (lateRuntime) => lateRuntime.close({
-          reason: "ACPX runtime admission aborted",
-        }),
+        acquire: () =>
+          dependencies.openRuntime({
+            command: command!,
+            profile,
+            cwd: binding.workspacePath,
+            stateDirectory: sandbox.stateDirectory,
+            providerSessionKey: binding.profileSessionKey,
+            permissionMode: binding.permissionMode,
+            permissionPolicy: acpxRuntimePermissionPolicy(
+              binding.permissionMode,
+            ),
+            launchEnvironment: sandbox.launchEnvironment,
+            systemInstructions: boundedInstructions(options.systemInstructions),
+            ...(options.signal === undefined ? {} : { signal: options.signal }),
+          }),
+        resource: "runtime",
+        releaseLate: (lateRuntime) =>
+          lateRuntime.close({
+            reason: "ACPX runtime admission aborted",
+          }),
+        reportFailure: (failure) =>
+          dependencies.reportRetainedCleanupFailure(failure),
       });
-      await runAbortableAdmissionStage(
-        options.signal,
-        () => requireVerifiedAcpxModel(runtime!, profile),
+      await runAbortableAdmissionStage(options.signal, () =>
+        requireVerifiedAcpxModel(runtime!, profile),
       );
       const runtimeIdentity = await runAbortableAdmissionStage(
         options.signal,
@@ -286,7 +307,9 @@ async function runAbortableAdmissionStage<T>(
 async function acquireAbortableAdmissionResource<T>(input: {
   signal: AbortSignal | undefined;
   acquire: () => Promise<T>;
+  resource: AcpxRetainedCleanupFailure["resource"];
   releaseLate: (resource: T) => Promise<void>;
+  reportFailure: (failure: AcpxRetainedCleanupFailure) => void;
 }): Promise<T> {
   if (input.signal === undefined) return await input.acquire();
   input.signal.throwIfAborted();
@@ -296,7 +319,14 @@ async function acquireAbortableAdmissionResource<T>(input: {
   } catch (error) {
     if (input.signal.aborted) {
       retainRuntimeHostCleanup(
-        pending.then((resource) => input.releaseLate(resource)),
+        pending.then((resource) =>
+          releaseRetainedAdmissionResource({
+            resource,
+            resourceKind: input.resource,
+            release: input.releaseLate,
+            reportFailure: input.reportFailure,
+          }),
+        ),
       );
     }
     throw error;
@@ -325,6 +355,46 @@ function raceAdmissionWithAbort<T>(
       (value) => settle(() => resolve(value)),
       (error: unknown) => settle(() => reject(error)),
     );
+  });
+}
+
+async function releaseRetainedAdmissionResource<T>(input: {
+  resource: T;
+  resourceKind: AcpxRetainedCleanupFailure["resource"];
+  release: (resource: T) => Promise<void>;
+  reportFailure: (failure: AcpxRetainedCleanupFailure) => void;
+}): Promise<void> {
+  let attempt = 0;
+  let retryDelayMs = RETAINED_CLEANUP_RETRY_INITIAL_DELAY_MS;
+  for (;;) {
+    attempt += 1;
+    try {
+      await input.release(input.resource);
+      return;
+    } catch (error) {
+      try {
+        input.reportFailure({
+          resource: input.resourceKind,
+          attempt,
+          error,
+        });
+      } catch {
+        // The required reporter is observational. A broken reporter must not
+        // relinquish ownership of the resource that still needs cleanup.
+      }
+      await waitForRetainedCleanupRetry(retryDelayMs);
+      retryDelayMs = Math.min(
+        retryDelayMs * 2,
+        RETAINED_CLEANUP_RETRY_MAX_DELAY_MS,
+      );
+    }
+  }
+}
+
+async function waitForRetainedCleanupRetry(delayMs: number): Promise<void> {
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, delayMs);
+    timer.unref?.();
   });
 }
 

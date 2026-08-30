@@ -285,6 +285,7 @@ describe("ACPX runtime host", () => {
           openCommand,
         }),
         openRuntime,
+        reportRetainedCleanupFailure: vi.fn(),
       },
     );
     await vi.waitFor(() => expect(openCommand).toHaveBeenCalledOnce());
@@ -304,12 +305,21 @@ describe("ACPX runtime host", () => {
 
   it("closes a credential lease that resolves after admission is aborted", async () => {
     const fixture = await hostFixture();
+    const lateCredentialPath = join(fixture.root, "late-auth.json");
+    await writeFile(lateCredentialPath, '{"access_token":"canary"}');
     const credentialAdmission = deferred<{
       path: string;
       mode: "inline_json";
       close(): Promise<void>;
     }>();
-    const lateCredentialClose = vi.fn(async () => undefined);
+    const cleanupFailure = new Error("transient credential cleanup failure");
+    let cleanupAttempts = 0;
+    const lateCredentialClose = vi.fn(async () => {
+      cleanupAttempts += 1;
+      if (cleanupAttempts === 1) throw cleanupFailure;
+      await rm(lateCredentialPath);
+    });
+    const reportRetainedCleanupFailure = vi.fn();
     const stageCredential = vi.fn(() => credentialAdmission.promise);
     const openRuntime = vi.fn(async () => runtimePort());
     const controller = new AbortController();
@@ -323,7 +333,10 @@ describe("ACPX runtime host", () => {
         signal: controller.signal,
       },
       {
-        ...fixture.dependencies({ openRuntime }),
+        ...fixture.dependencies({
+          openRuntime,
+          reportRetainedCleanupFailure,
+        }),
         stageCredential,
       },
     );
@@ -332,12 +345,25 @@ describe("ACPX runtime host", () => {
     controller.abort(cancellation);
     await expect(opening).rejects.toBe(cancellation);
     credentialAdmission.resolve({
-      path: join(fixture.root, "late-auth.json"),
+      path: lateCredentialPath,
       mode: "inline_json",
       close: lateCredentialClose,
     });
 
-    await vi.waitFor(() => expect(lateCredentialClose).toHaveBeenCalledOnce());
+    await vi.waitFor(() =>
+      expect(lateCredentialClose).toHaveBeenCalledTimes(2),
+    );
+    await vi.waitFor(async () =>
+      expect(readFile(lateCredentialPath)).rejects.toMatchObject({
+        code: "ENOENT",
+      }),
+    );
+    expect(reportRetainedCleanupFailure).toHaveBeenCalledOnce();
+    expect(reportRetainedCleanupFailure).toHaveBeenCalledWith({
+      resource: "credential",
+      attempt: 1,
+      error: cleanupFailure,
+    });
     expect(openRuntime).not.toHaveBeenCalled();
     expect(fixture.commandClose).not.toHaveBeenCalled();
   });
@@ -374,9 +400,11 @@ describe("ACPX runtime host", () => {
     expect(fixture.commandClose).toHaveBeenCalledOnce();
     runtimeAdmission.resolve(lateRuntime);
 
-    await vi.waitFor(() => expect(lateRuntime.close).toHaveBeenCalledWith({
-      reason: "ACPX runtime admission aborted",
-    }));
+    await vi.waitFor(() =>
+      expect(lateRuntime.close).toHaveBeenCalledWith({
+        reason: "ACPX runtime admission aborted",
+      }),
+    );
   });
 });
 
@@ -428,7 +456,10 @@ async function hostFixture() {
       workingDirectory,
     },
     dependencies(
-      input: Pick<AcpxRuntimeHostDependencies, "openRuntime">,
+      input: Pick<AcpxRuntimeHostDependencies, "openRuntime"> &
+        Partial<
+          Pick<AcpxRuntimeHostDependencies, "reportRetainedCleanupFailure">
+        >,
     ): AcpxRuntimeHostDependencies {
       return {
         verifyInstallation: async (profile) =>
@@ -439,6 +470,8 @@ async function hostFixture() {
             openCommand: async () => command,
           }) satisfies VerifiedAcpxInstallation,
         openRuntime: input.openRuntime,
+        reportRetainedCleanupFailure:
+          input.reportRetainedCleanupFailure ?? vi.fn(),
       };
     },
   };
