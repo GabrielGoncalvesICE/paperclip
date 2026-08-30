@@ -422,7 +422,6 @@ async function closeCredentialLeaseServer(server: Server): Promise<void> {
       if (error) rejectClose(error);
       else resolveClose();
     });
-    server.closeAllConnections();
   });
 }
 function quarantineCredentialCleanup(
@@ -825,7 +824,7 @@ async function syncDirectoryDurably(directory: string): Promise<void> {
       if (
         attempt === MAX_DIRECTORY_SYNC_ATTEMPTS ||
         error instanceof DirectorySyncOperationTimeoutError ||
-        error instanceof PermanentDirectorySyncHelperError
+        error instanceof UnconfirmedDirectorySyncHelperTerminationError
       ) {
         break;
       }
@@ -846,13 +845,14 @@ async function syncDirectoryDurably(directory: string): Promise<void> {
 
 async function syncDirectory(directory: string): Promise<void> {
   if (process.platform === "win32") return;
+  reclaimConfirmedExitedDirectorySyncHelpers();
   // Once an in-process filesystem request times out it cannot be cancelled.
   // Keep that single request observed, and permanently use killable helper
   // processes for this home so recovery remains available without accumulating
   // additional parent-process handles or requests.
   if (isolatedDirectorySyncHomes.has(directory)) {
     if (failedIsolatedDirectorySyncHomes.has(directory)) {
-      throw new PermanentDirectorySyncHelperError(directory);
+      throw new UnconfirmedDirectorySyncHelperTerminationError(directory);
     }
     await syncDirectoryInIsolatedProcess(directory);
     return;
@@ -982,8 +982,9 @@ function reserveParentDirectorySyncOperation(): symbol | null {
 async function syncDirectoryInIsolatedProcess(
   directory: string,
 ): Promise<void> {
+  reclaimConfirmedExitedDirectorySyncHelpers();
   if (failedIsolatedDirectorySyncHomes.has(directory)) {
-    throw new PermanentDirectorySyncHelperError(directory);
+    throw new UnconfirmedDirectorySyncHelperTerminationError(directory);
   }
   const activeAttempt = isolatedDirectorySyncAttempts.get(directory);
   if (activeAttempt !== undefined) return await activeAttempt;
@@ -999,6 +1000,7 @@ async function syncDirectoryInIsolatedProcess(
 }
 
 async function runDirectorySyncHelper(directory: string): Promise<void> {
+  reclaimConfirmedExitedDirectorySyncHelpers();
   if (
     directorySyncHelperRegistry.activeChildren.size >=
     MAX_DIRECTORY_SYNC_HELPERS
@@ -1027,9 +1029,11 @@ async function runDirectorySyncHelper(directory: string): Promise<void> {
     );
     directorySyncHelperRegistry.activeChildren.add(child);
     child.unref();
-  } catch {
-    failedIsolatedDirectorySyncHomes.add(directory);
-    throw new PermanentDirectorySyncHelperError(directory);
+  } catch (error) {
+    throw new Error(
+      `Managed Codex credential directory helper could not start for ${directory}`,
+      { cause: error },
+    );
   }
   await new Promise<void>((resolveHelper, rejectHelper) => {
     let timeout: NodeJS.Timeout | undefined;
@@ -1053,18 +1057,19 @@ async function runDirectorySyncHelper(directory: string): Promise<void> {
       directorySyncHelperRegistry.activeChildren.delete(child);
       if (stuckDirectorySyncHelpers.get(directory) === child) {
         stuckDirectorySyncHelpers.delete(directory);
+        failedIsolatedDirectorySyncHomes.delete(directory);
       }
       child.off("error", onError);
       child.off("exit", onExit);
       child.off("close", onClose);
     };
-    const fencePermanently = (): void => {
+    const fenceUntilExitConfirmed = (): void => {
       failedIsolatedDirectorySyncHomes.add(directory);
       stuckDirectorySyncHelpers.set(directory, child);
-      settle(new PermanentDirectorySyncHelperError(directory));
+      settle(new UnconfirmedDirectorySyncHelperTerminationError(directory));
     };
     const onError = (): void => {
-      fencePermanently();
+      fenceUntilExitConfirmed();
       // A missing pid proves spawn never created a process, so no retained
       // reaper or global capacity slot is necessary.
       if (child.pid === undefined) reap();
@@ -1098,22 +1103,50 @@ async function runDirectorySyncHelper(directory: string): Promise<void> {
       // this is the resource-release acknowledgement the in-process API lacks.
       try {
         if (!child.kill("SIGKILL")) {
-          fencePermanently();
+          fenceUntilExitConfirmed();
+          reclaimConfirmedExitedDirectorySyncHelpers();
           return;
         }
         killAcknowledgementTimeout = setTimeout(() => {
           // A child that does not acknowledge SIGKILL is retained as the sole
-          // reaper for this home. Permanently fail closed so no later attempt
-          // can accumulate another possibly stuck process.
-          fencePermanently();
+          // reaper for this home. Fail closed until an event or a kernel probe
+          // confirms exit, so no later attempt can accumulate another process.
+          fenceUntilExitConfirmed();
+          reclaimConfirmedExitedDirectorySyncHelpers();
         }, DIRECTORY_SYNC_HELPER_KILL_ACK_TIMEOUT_MS);
         killAcknowledgementTimeout.unref?.();
       } catch {
-        fencePermanently();
+        fenceUntilExitConfirmed();
+        reclaimConfirmedExitedDirectorySyncHelpers();
       }
     }, DIRECTORY_SYNC_OPERATION_TIMEOUT_MS);
     timeout.unref?.();
   });
+}
+
+function reclaimConfirmedExitedDirectorySyncHelpers(): void {
+  for (const [directory, child] of stuckDirectorySyncHelpers) {
+    let exited =
+      (child.exitCode !== null && child.exitCode !== undefined) ||
+      (child.signalCode !== null && child.signalCode !== undefined);
+    if (!exited && child.pid !== undefined) {
+      try {
+        // ChildProcess events are advisory for capacity accounting: an exited
+        // helper can fail to deliver `exit`/`close` while its owner is under
+        // pressure. A signal-0 ESRCH result is the kernel confirmation that
+        // reclaiming this global slot cannot permit another live helper.
+        process.kill(child.pid, 0);
+      } catch (error) {
+        exited = errorCode(error) === "ESRCH";
+      }
+    }
+    if (!exited) continue;
+    directorySyncHelperRegistry.activeChildren.delete(child);
+    if (stuckDirectorySyncHelpers.get(directory) === child) {
+      stuckDirectorySyncHelpers.delete(directory);
+      failedIsolatedDirectorySyncHomes.delete(directory);
+    }
+  }
 }
 
 function retainDirectorySyncCleanup(
@@ -1151,12 +1184,12 @@ class DirectorySyncOperationTimeoutError extends Error {
   }
 }
 
-class PermanentDirectorySyncHelperError extends Error {
+class UnconfirmedDirectorySyncHelperTerminationError extends Error {
   constructor(directory: string) {
     super(
-      `Managed Codex credential directory helper termination was not acknowledged and is permanently unavailable for ${directory}`,
+      `Managed Codex credential directory helper termination was not acknowledged for ${directory}`,
     );
-    this.name = "PermanentDirectorySyncHelperError";
+    this.name = "UnconfirmedDirectorySyncHelperTerminationError";
   }
 }
 

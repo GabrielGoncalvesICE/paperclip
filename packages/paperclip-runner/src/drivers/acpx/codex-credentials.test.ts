@@ -1264,6 +1264,102 @@ describe("managed Codex credentials", () => {
   );
 
   it.runIf(process.platform !== "win32")(
+    "reclaims kernel-confirmed helper exits when child events are lost",
+    async () => {
+      const fixture = await credentialFixture();
+      const registry = (
+        globalThis as typeof globalThis & {
+          __paperclipDirectorySyncHelperRegistryV1?: {
+            activeChildren: Set<ChildProcess>;
+            activeParentOperations: Set<symbol>;
+            failedHomes: Set<string>;
+            stuckChildren: Map<string, ChildProcess>;
+          };
+        }
+      ).__paperclipDirectorySyncHelperRegistryV1;
+      expect(registry).toBeDefined();
+
+      const parentReservations = Array.from({ length: 4 }, () => Symbol());
+      for (const reservation of parentReservations) {
+        registry!.activeParentOperations.add(reservation);
+      }
+      const departedPids = new Set<number>();
+      const departedHelpers = Array.from({ length: 4 }, (_, index) => {
+        const pid = 41_000 + index;
+        departedPids.add(pid);
+        const child = Object.assign(new EventEmitter(), {
+          exitCode: null,
+          kill: vi.fn(() => true),
+          pid,
+          signalCode: null,
+          unref: vi.fn(),
+        }) as unknown as ChildProcess;
+        const directory = `/departed-credential-helper-${String(index)}`;
+        registry!.activeChildren.add(child);
+        registry!.failedHomes.add(directory);
+        registry!.stuckChildren.set(directory, child);
+        return { child, directory };
+      });
+      const killSpy = vi
+        .spyOn(process, "kill")
+        .mockImplementation((pid, signal) => {
+          if (signal === 0 && departedPids.has(Number(pid))) {
+            throw Object.assign(new Error("process no longer exists"), {
+              code: "ESRCH",
+            });
+          }
+          return true;
+        });
+      const observedActiveChildren: number[] = [];
+      let nextPid = 42_000;
+      const spawnMock = vi.fn(() => {
+        observedActiveChildren.push(registry!.activeChildren.size);
+        const child = Object.assign(new EventEmitter(), {
+          exitCode: null,
+          kill: vi.fn(() => true),
+          pid: nextPid++,
+          signalCode: null,
+          unref: vi.fn(),
+        }) as unknown as ChildProcess;
+        queueMicrotask(() => {
+          child.emit("exit", 0, null);
+          child.emit("close", 0, null);
+        });
+        return child;
+      });
+      vi.doMock("node:child_process", () => ({ spawn: spawnMock }));
+      vi.resetModules();
+      const freshCredentials = await import("./codex-credentials.js");
+
+      try {
+        const lease = await freshCredentials.stageManagedCodexCredential({
+          agentHomeDirectory: fixture.home,
+          environment: { OPENAI_API_KEY: "launch-only-key" },
+        });
+        await lease.close();
+
+        expect(spawnMock).toHaveBeenCalled();
+        expect(observedActiveChildren.every((count) => count < 4)).toBe(true);
+        for (const { child, directory } of departedHelpers) {
+          expect(registry!.activeChildren).not.toContain(child);
+          expect(registry!.failedHomes).not.toContain(directory);
+          expect(registry!.stuckChildren.has(directory)).toBe(false);
+        }
+      } finally {
+        killSpy.mockRestore();
+        for (const reservation of parentReservations) {
+          registry!.activeParentOperations.delete(reservation);
+        }
+        for (const { child, directory } of departedHelpers) {
+          registry!.activeChildren.delete(child);
+          registry!.failedHomes.delete(directory);
+          registry!.stuckChildren.delete(directory);
+        }
+      }
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
     "keeps intent-publication failure before credential mutation and scrubs without process memory",
     async () => {
       const fixture = await credentialFixture();
