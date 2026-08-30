@@ -1201,7 +1201,7 @@ describe("ACPX installation integrity", () => {
     },
   );
 
-  it.runIf(process.platform !== "win32")(
+  it.runIf(process.platform === "linux")(
     "keeps the staged credential fenced through owner SIGKILL and reaps the provider group",
     async () => {
       const fixture = await persistentInstallationFixture();
@@ -1297,7 +1297,7 @@ describe("ACPX installation integrity", () => {
     },
   );
 
-  it.runIf(process.platform !== "win32")(
+  it.runIf(process.platform === "linux")(
     "reaps a fenced provider when its lifetime guardian is SIGKILLed",
     async () => {
       const fixture = await persistentInstallationFixture();
@@ -1386,7 +1386,7 @@ describe("ACPX installation integrity", () => {
     },
   );
 
-  it.runIf(process.platform !== "win32")(
+  it.runIf(process.platform === "linux")(
     "dismisses the lifetime sentinel only after normal provider-group cleanup",
     async () => {
       const fixture = await persistentInstallationFixture();
@@ -1427,6 +1427,42 @@ describe("ACPX installation integrity", () => {
           expect(canBindLoopbackPort(port)).resolves.toBe(true),
         ),
       );
+    },
+  );
+
+  it.runIf(process.platform === "linux")(
+    "routes emergency child kill through the live guardian owner pipe",
+    async () => {
+      const fixture = await persistentInstallationFixture();
+      const pidFile = join(fixture.root, "emergency-provider.pid");
+      const fences = await Promise.all([
+        listenOnLoopback(),
+        listenOnLoopback(),
+      ]);
+      const fenceFds = fences.map(
+        (fence) =>
+          (fence as Server & { _handle?: { fd?: number } })._handle?.fd,
+      );
+      expect(fenceFds.every(Number.isSafeInteger)).toBe(true);
+      expect(fenceFds[0]).not.toBe(fenceFds[1]);
+      const installation = await verifyQualifiedAcpxInstallation(
+        fixture.profile,
+        fixture.resolve,
+      );
+      const guardian = (await installation.openCommand()).spawn(
+        [],
+        { env: { ...process.env, PAPERCLIP_PROVIDER_PID_FILE: pidFile } },
+        {
+          credentialFenceFds: [fenceFds[0]!, fenceFds[1]!],
+          activateCredentialFenceOwner: async () => undefined,
+        },
+      );
+      await awaitVerifiedAcpxProviderOwnership(guardian);
+      const providerPid = Number.parseInt(await waitForFile(pidFile), 10);
+      expect(guardian.kill("SIGKILL")).toBe(true);
+      await once(guardian, "exit");
+      await waitUntil(() => !processAlive(providerPid));
+      await Promise.all(fences.map(closeServer));
     },
   );
 });
