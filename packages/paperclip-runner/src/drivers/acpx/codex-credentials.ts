@@ -1136,10 +1136,12 @@ async function syncDirectory(directory: string): Promise<void> {
     if (error instanceof DirectorySyncOperationTimeoutError) {
       // open(2) cannot be cancelled. If the kernel eventually returns a
       // handle after our retry budget has advanced, close it without keeping
-      // credential admission or cleanup pending.
-      void openAttempt
-        .then((lateHandle) => closeDirectoryHandle(lateHandle, directory))
-        .catch(() => undefined);
+      // another open from racing the unresolved request or its late close.
+      const cleanupAttempt = openAttempt.then(
+        (lateHandle) => closeDirectoryHandle(lateHandle, directory),
+        () => undefined,
+      );
+      retainDirectorySyncCleanup(directory, cleanupAttempt);
     }
     throw error;
   }
