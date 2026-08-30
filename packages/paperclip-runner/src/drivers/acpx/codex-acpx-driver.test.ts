@@ -512,9 +512,10 @@ describe("Codex ACPX harness driver", () => {
       fixture.host.close.mockImplementation(({ reason }) =>
         reason.includes("scheduled quarantined cleanup recovery")
           ? // Exercise the complete production host bound: two seconds for
-            // active-turn cancellation plus six seconds for protocol/TERM/KILL.
-            new Promise<void>((resolve) => setTimeout(resolve, 8_500))
-          : Promise.resolve(),
+            // active-turn cancellation plus bounded protocol, TERM, and
+            // guardian-group KILL.
+            new Promise<void>((resolve) => setTimeout(resolve, 9_500))
+          : Promise.resolve()
       );
       await vi.advanceTimersToNextTimerAsync();
       let admissionSettled = false;
@@ -536,7 +537,7 @@ describe("Codex ACPX harness driver", () => {
         reason:
           "runtime close persistently failed (scheduled quarantined cleanup recovery)",
       });
-      await vi.advanceTimersByTimeAsync(8_499);
+      await vi.advanceTimersByTimeAsync(9_499);
       expect(admissionSettled).toBe(false);
       await vi.advanceTimersByTimeAsync(1);
       await expect(admission).resolves.toBeDefined();
@@ -638,7 +639,7 @@ describe("Codex ACPX harness driver", () => {
           setTimeout(() => {
             if (attempt < 3) reject(new Error("transient quarantine failure"));
             else resolve();
-          }, 8_000);
+          }, 9_000);
         });
       });
       const session = await fixture.driver.openSession({
@@ -669,7 +670,7 @@ describe("Codex ACPX harness driver", () => {
           admissionSettled = true;
         },
       );
-      await vi.advanceTimersByTimeAsync(23_000);
+      await vi.advanceTimersByTimeAsync(26_000);
       expect(admissionSettled).toBe(false);
       expect(fixture.host.close).toHaveBeenCalledTimes(7);
       await vi.advanceTimersByTimeAsync(2_000);
@@ -976,7 +977,7 @@ describe("Codex ACPX harness driver", () => {
           admissionSettled = true;
         })
         .catch(() => undefined);
-      await vi.advanceTimersByTimeAsync(34_999);
+      await vi.advanceTimersByTimeAsync(38_999);
       expect(admissionSettled).toBe(false);
       await vi.advanceTimersByTimeAsync(2);
       await expect(admission).rejects.toThrow("exceeded the admission grace");
