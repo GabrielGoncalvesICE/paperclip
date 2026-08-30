@@ -123,6 +123,12 @@ export interface AcpxMcpServerBinding {
 
 export type AcpxSemanticToolSession = Omit<RunnerToolBridgeOptions, "secret">;
 
+export interface AcpxRetainedCleanupFailure {
+  resource: "credential" | "command" | "runtime" | "tool_bridge";
+  attempt: number;
+  error: unknown;
+}
+
 export interface AcpxRuntimeHostDependencies {
   verifyInstallation?: (
     profile: QualifiedAcpxProfile,
@@ -140,6 +146,11 @@ export interface AcpxRuntimeHostDependencies {
    * bounded admission wait can return.
    */
   retainAdmissionCleanup?: (cleanup: Promise<void>) => void;
+  /**
+   * Required observability channel for resources acquired after admission was
+   * aborted. Implementations must not throw from this callback.
+   */
+  reportRetainedCleanupFailure(failure: AcpxRetainedCleanupFailure): void;
 }
 
 export interface OpenAcpxRuntimeHostOptions {
@@ -161,6 +172,8 @@ export interface OpenAcpxRuntimeHostOptions {
 }
 
 const activeRuntimeHostCleanupOwners = new Set<Promise<unknown>>();
+const RETAINED_CLEANUP_RETRY_INITIAL_DELAY_MS = 10;
+const RETAINED_CLEANUP_RETRY_MAX_DELAY_MS = 1_000;
 
 interface RetainedRejectedRuntimeAdmission {
   readonly credential: ManagedCodexCredentialLease;
@@ -317,19 +330,28 @@ export class AcpxRuntimeHost {
               environment: options.environment,
               sourcePath: options.managedCodexCredentialSourcePath,
             }),
+          resource: "credential",
           releaseLate: (lateCredential) => lateCredential.close(),
+          reportFailure: (failure) =>
+            dependencies.reportRetainedCleanupFailure(failure),
         });
       }
       command = await acquireAbortableAdmissionResource({
         signal: options.signal,
         acquire: () => installation.openCommand(),
+        resource: "command",
         releaseLate: (lateCommand) => lateCommand.close(),
+        reportFailure: (failure) =>
+          dependencies.reportRetainedCleanupFailure(failure),
       });
       toolBridge = options.semanticTools
         ? await acquireAbortableAdmissionResource({
             signal: options.signal,
             acquire: () => startRunnerToolBridge(options.semanticTools!),
+            resource: "tool_bridge",
             releaseLate: (lateToolBridge) => lateToolBridge.close(),
+            reportFailure: (failure) =>
+              dependencies.reportRetainedCleanupFailure(failure),
           })
         : null;
       runtime = await acquireAbortableAdmissionResource({
@@ -370,10 +392,13 @@ export class AcpxRuntimeHost {
             retainFailedAdmissionCleanup,
           });
         },
+        resource: "runtime",
         releaseLate: (lateRuntime) =>
           lateRuntime.close({
             reason: "ACPX runtime admission aborted",
           }),
+        reportFailure: (failure) =>
+          dependencies.reportRetainedCleanupFailure(failure),
         onAbortedPending: (pendingRuntime) => {
           // A provider may already be running even though openRuntime has not
           // returned its port. Keep its credential lease with that exact
@@ -592,8 +617,10 @@ async function runAbortableAdmissionStage<T>(
 async function acquireAbortableAdmissionResource<T>(input: {
   signal: AbortSignal | undefined;
   acquire: () => Promise<T>;
+  resource: AcpxRetainedCleanupFailure["resource"];
   releaseLate: (resource: T) => Promise<void>;
   onAbortedPending?: (pending: Promise<T>) => void;
+  reportFailure: (failure: AcpxRetainedCleanupFailure) => void;
 }): Promise<T> {
   if (input.signal === undefined) return await input.acquire();
   input.signal.throwIfAborted();
@@ -606,7 +633,14 @@ async function acquireAbortableAdmissionResource<T>(input: {
         input.onAbortedPending(pending);
       } else {
         retainRuntimeHostCleanup(
-          pending.then((resource) => input.releaseLate(resource)),
+          pending.then((resource) =>
+            releaseRetainedAdmissionResource({
+              resource,
+              resourceKind: input.resource,
+              release: input.releaseLate,
+              reportFailure: input.reportFailure,
+            }),
+          ),
         );
       }
     }
@@ -750,6 +784,46 @@ function scheduleRetainedAcpxAdmissionCleanup(
 }
 
 async function waitForAdmissionCleanupRetry(delayMs: number): Promise<void> {
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, delayMs);
+    timer.unref?.();
+  });
+}
+
+async function releaseRetainedAdmissionResource<T>(input: {
+  resource: T;
+  resourceKind: AcpxRetainedCleanupFailure["resource"];
+  release: (resource: T) => Promise<void>;
+  reportFailure: (failure: AcpxRetainedCleanupFailure) => void;
+}): Promise<void> {
+  let attempt = 0;
+  let retryDelayMs = RETAINED_CLEANUP_RETRY_INITIAL_DELAY_MS;
+  for (;;) {
+    attempt += 1;
+    try {
+      await input.release(input.resource);
+      return;
+    } catch (error) {
+      try {
+        input.reportFailure({
+          resource: input.resourceKind,
+          attempt,
+          error,
+        });
+      } catch {
+        // The required reporter is observational. A broken reporter must not
+        // relinquish ownership of the resource that still needs cleanup.
+      }
+      await waitForRetainedCleanupRetry(retryDelayMs);
+      retryDelayMs = Math.min(
+        retryDelayMs * 2,
+        RETAINED_CLEANUP_RETRY_MAX_DELAY_MS,
+      );
+    }
+  }
+}
+
+async function waitForRetainedCleanupRetry(delayMs: number): Promise<void> {
   await new Promise<void>((resolve) => {
     const timer = setTimeout(resolve, delayMs);
     timer.unref?.();
