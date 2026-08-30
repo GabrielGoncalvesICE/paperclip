@@ -25,6 +25,7 @@ import { openCodexAcpxRuntime } from "../drivers/acpx/codex-runtime-adapter.js";
 import { resolveQualifiedAcpxProfile } from "../drivers/acpx/qualified-profiles.js";
 import {
   AcpxRuntimeHost,
+  type AcpxRetainedCleanupFailure,
   type AcpxRuntimeTurn,
 } from "../drivers/acpx/runtime-host.js";
 import {
@@ -66,11 +67,9 @@ import {
 const MAX_PENDING_TOOLS = 512;
 const MAX_PENDING_INPUTS = 16;
 
-function reportRetainedAcpxCleanupFailure(input: {
-  resource: "credential" | "command" | "runtime" | "tool_bridge";
-  attempt: number;
-  error: unknown;
-}): void {
+function reportRetainedAcpxCleanupFailure(
+  input: AcpxRetainedCleanupFailure,
+): void {
   const errorName = input.error instanceof Error ? input.error.name : "Error";
   process.emitWarning(
     JSON.stringify({
