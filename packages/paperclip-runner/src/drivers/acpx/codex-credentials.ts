@@ -1,20 +1,15 @@
-import { createHash, randomBytes } from "node:crypto";
+import { spawn, type ChildProcess } from "node:child_process";
+import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import {
   lstat,
   open,
-  readdir,
   realpath,
   rename,
   unlink,
   type FileHandle,
 } from "node:fs/promises";
-import {
-  createConnection,
-  createServer,
-  type Server,
-  type Socket,
-} from "node:net";
+import { createServer, type Server } from "node:net";
 import { isAbsolute, join, resolve } from "node:path";
 
 const MAX_CODEX_CREDENTIAL_BYTES = 256 * 1024;
@@ -23,28 +18,35 @@ const MAX_DIRECTORY_SYNC_ATTEMPTS = 8;
 const DIRECTORY_SYNC_OPERATION_TIMEOUT_MS = 1_000;
 const MAX_AUTONOMOUS_CREDENTIAL_CLEANUP_ATTEMPTS = 8;
 const CREDENTIAL_CLEANUP_INTENT = ".paperclip-auth-cleanup-required";
+const CREDENTIAL_STAGING_FILE = ".paperclip-auth-staging-v1";
 const CREDENTIAL_LEASE_HOST = "127.0.0.1";
 const CREDENTIAL_LEASE_PORT_MIN = 49_152;
 const CREDENTIAL_LEASE_PORT_COUNT = 16_384;
-const MAX_CREDENTIAL_LEASE_PORT_CANDIDATES = 32;
-const CREDENTIAL_LEASE_PROBE_TIMEOUT_MS = 1_000;
-const CREDENTIAL_LEASE_PROTOCOL = "paperclip-managed-codex-lease-v1";
-const CREDENTIAL_LEASE_FOREIGN_PROBE =
-  "GET /__paperclip_credential_lease_probe__ HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n";
-const CREDENTIAL_LEASE_MARKER_PREFIX = ".paperclip-auth-lease-v1-";
-const MAX_CREDENTIAL_LEASE_MARKERS = 1_024;
+const CREDENTIAL_LEASE_CANDIDATES = 3;
+const CREDENTIAL_LEASE_QUORUM = 2;
+const DIRECTORY_SYNC_HELPER_KILL_ACK_TIMEOUT_MS = 1_000;
+const MAX_DIRECTORY_SYNC_HELPERS = 4;
+const MAX_PARENT_DIRECTORY_SYNC_OPERATIONS = 4;
+const DIRECTORY_SYNC_HELPER_SOURCE = String.raw`
+import { constants } from "node:fs";
+import { open } from "node:fs/promises";
+
+const directory = process.argv[1];
+if (typeof directory !== "string") throw new Error("directory is required");
+const handle = await open(
+  directory,
+  constants.O_RDONLY | (constants.O_DIRECTORY ?? 0),
+);
+try {
+  await handle.sync();
+} finally {
+  await handle.close();
+}
+`;
 
 interface CredentialHomeLock {
   assertHeld(): void;
   release(): Promise<void>;
-}
-
-interface CredentialLeaseMarker {
-  version: 1;
-  identity: string;
-  pid: number;
-  port: number;
-  token: string;
 }
 
 interface QuarantinedCredentialCleanup {
@@ -57,29 +59,47 @@ interface QuarantinedCredentialCleanup {
 }
 
 type CredentialLeaseGeneration = number;
-type CredentialLeaseProbe =
-  | "matching_owner"
-  | "different_owner"
-  | "unresponsive"
-  | "unoccupied";
+
+interface DirectorySyncHelperRegistry {
+  activeChildren: Set<ChildProcess>;
+  activeParentOperations: Set<symbol>;
+  attempts: Map<string, Promise<void>>;
+  failedHomes: Set<string>;
+  isolatedHomes: Set<string>;
+  pendingCleanups: Map<string, Promise<void>>;
+  stuckChildren: Map<string, ChildProcess>;
+}
 
 const quarantinedCredentialCleanups = new Map<
   string,
   QuarantinedCredentialCleanup
 >();
-const pendingDirectorySyncCleanups = new Map<string, Promise<void>>();
+const processDirectorySyncHelperState = globalThis as typeof globalThis & {
+  __paperclipDirectorySyncHelperRegistryV1?: DirectorySyncHelperRegistry;
+};
+const directorySyncHelperRegistry =
+  processDirectorySyncHelperState.__paperclipDirectorySyncHelperRegistryV1 ?? {
+    activeChildren: new Set<ChildProcess>(),
+    activeParentOperations: new Set<symbol>(),
+    attempts: new Map<string, Promise<void>>(),
+    failedHomes: new Set<string>(),
+    isolatedHomes: new Set<string>(),
+    pendingCleanups: new Map<string, Promise<void>>(),
+    stuckChildren: new Map<string, ChildProcess>(),
+  };
+processDirectorySyncHelperState.__paperclipDirectorySyncHelperRegistryV1 =
+  directorySyncHelperRegistry;
+const pendingDirectorySyncCleanups =
+  directorySyncHelperRegistry.pendingCleanups;
+const isolatedDirectorySyncHomes = directorySyncHelperRegistry.isolatedHomes;
+const isolatedDirectorySyncAttempts = directorySyncHelperRegistry.attempts;
+const failedIsolatedDirectorySyncHomes =
+  directorySyncHelperRegistry.failedHomes;
+const stuckDirectorySyncHelpers = directorySyncHelperRegistry.stuckChildren;
 const activeCredentialLeaseGenerations = new Map<
   string,
   CredentialLeaseGeneration
 >();
-const processCredentialLeaseState = globalThis as typeof globalThis & {
-  __paperclipCredentialLeaseIdentitiesV1?: Map<number, string>;
-};
-const processCredentialLeaseIdentities =
-  processCredentialLeaseState.__paperclipCredentialLeaseIdentitiesV1 ??
-  new Map<number, string>();
-processCredentialLeaseState.__paperclipCredentialLeaseIdentitiesV1 =
-  processCredentialLeaseIdentities;
 let nextCredentialLeaseGeneration = 0;
 
 export type ManagedCodexCredentialMode =
@@ -125,7 +145,10 @@ export async function stageManagedCodexCredential(input: {
       lock,
     );
   } catch (error) {
-    if (lock !== null && quarantinedCredentialCleanups.get(home)?.lock !== lock) {
+    if (
+      lock !== null &&
+      quarantinedCredentialCleanups.get(home)?.lock !== lock
+    ) {
       await lock.release().catch(() => undefined);
     }
     releaseCredentialLeaseGeneration(home, ownerGeneration);
@@ -143,14 +166,20 @@ async function stageClaimedManagedCodexCredential(
   lock: CredentialHomeLock,
 ): Promise<ManagedCodexCredentialLease> {
   const destination = join(home, "auth.json");
+  const stagingPath = join(home, CREDENTIAL_STAGING_FILE);
   const intentPath = join(home, CREDENTIAL_CLEANUP_INTENT);
   lock.assertHeld();
-  await recoverPersistedCredentialCleanup(destination, home, intentPath);
-  // The isolated home is itself the durable recovery anchor. Scrub auth.json
-  // before every admission, even when a prior cleanup-intent entry was lost
-  // with a runner crash. Only after this absence is durable may a new intent
-  // be created and a credential installed.
-  await removeCredential(destination, home);
+  await recoverPersistedCredentialCleanup(
+    destination,
+    stagingPath,
+    home,
+    intentPath,
+  );
+  // The isolated home is itself the durable recovery anchor. Scrub both the
+  // installed credential and the deterministic staging pathname before every
+  // admission, even when a prior cleanup-intent entry was lost with a runner
+  // crash. Only after their absence is durable may a new intent be created.
+  await removeCredentialArtifacts([destination, stagingPath], home);
   const environment = input.environment ?? {};
   const hasApiKey = Boolean(
     environment.CODEX_API_KEY || environment.OPENAI_API_KEY,
@@ -209,7 +238,7 @@ async function stageClaimedManagedCodexCredential(
     // credential mutation and therefore needs no process-only quarantine.
     await createCredentialCleanupIntent(intentPath, home);
     try {
-      await writeCredential(destination, home, credential);
+      await writeCredential(destination, stagingPath, home, credential);
     } catch (error) {
       // Rename may already have installed the credential before directory
       // durability failed. Retain a bounded process owner and the persisted
@@ -264,405 +293,103 @@ function releaseCredentialLeaseGeneration(
 async function acquireCredentialHomeLock(
   home: string,
 ): Promise<CredentialHomeLock> {
-  // ACPX credential homes are local-runtime resources: every contender for a
-  // canonical home runs on the same host and network namespace. A bounded set
-  // of deterministic loopback endpoints therefore provides a kernel-owned,
-  // process-lifetime lease without making one hash collision authoritative.
-  // The local runner also supervises its provider lifetime; a provider cannot
-  // remain an authorized writer after this owning process dies. Every
-  // Paperclip listener identifies its canonical home, so confirmed unrelated
-  // collisions fall through to another candidate while a matching live owner
-  // still fences the home. An occupied endpoint that does not answer within
-  // the bounded probe is authoritative: it may be a concurrent owner between
-  // bind and marker publication, so admission fails closed instead of letting
-  // two contenders select different ports. After binding, probing every other
-  // candidate closes the race where an earlier unrelated listener disappears
-  // while an owner uses a later one.
-  const identity = credentialLeaseIdentity(home);
-  const ports = credentialLeasePorts(home);
-  if (await hasActiveCredentialLeaseMarker(home, identity, ports)) {
-    throw new Error(
-      "Managed Codex credential home already has an active lease",
-    );
-  }
-  let server: Server | null = null;
-  let port: number | null = null;
-  let acceptedSockets = new Set<Socket>();
-  for (const candidatePort of ports) {
-    const candidateSockets = new Set<Socket>();
-    const candidate = createCredentialLeaseServer(identity, candidateSockets);
-    try {
-      await listenForCredentialLease(candidate, candidatePort);
-      processCredentialLeaseIdentities.set(candidatePort, identity);
-      server = candidate;
-      port = candidatePort;
-      acceptedSockets = candidateSockets;
-      break;
-    } catch (error) {
-      for (const socket of candidateSockets) socket.destroy();
-      if (errorCode(error) !== "EADDRINUSE") {
+  // This is deliberately markerless: authority is the live kernel ownership
+  // of any two candidates. Any two subsets of a three-port set intersect, so
+  // contenders cannot both reach quorum; one unrelated occupied listener is
+  // tolerated without probing or trusting the process behind it.
+  const servers: Server[] = [];
+  let invalid: Error | null = null;
+  let released = false;
+  try {
+    for (const port of credentialLeasePorts(home)) {
+      const server = createServer((socket) => socket.destroy());
+      try {
+        await listenForCredentialLease(server, port);
+      } catch (error) {
+        await closeCredentialLeaseServer(server);
+        if (errorCode(error) === "EADDRINUSE") continue;
         throw new Error(
           "Managed Codex credential ownership could not be established",
           { cause: error },
         );
       }
-      const probe = await probeCredentialLease(candidatePort, identity);
-      if (probe === "matching_owner") {
-        throw new Error(
-          "Managed Codex credential home already has an active lease",
-        );
-      }
-      if (probe === "unresponsive") {
-        throw new Error(
-          "Managed Codex credential ownership could not safely bypass an unresponsive lease endpoint",
-        );
-      }
-    }
-  }
-  if (server === null || port === null) {
-    throw new Error(
-      "Managed Codex credential ownership could not find a free loopback lease endpoint",
-    );
-  }
-
-  let invalid: Error | null = null;
-  let expectedClose = false;
-  server.on("error", (error) => {
-    invalid ??= error;
-  });
-  server.on("close", () => {
-    if (processCredentialLeaseIdentities.get(port) === identity) {
-      processCredentialLeaseIdentities.delete(port);
-    }
-    if (!expectedClose) {
-      invalid ??= new Error(
-        "Managed Codex credential ownership listener closed unexpectedly",
-      );
-    }
-  });
-  try {
-    const address = server.address();
-    if (
-      address === null ||
-      typeof address === "string" ||
-      address.address !== CREDENTIAL_LEASE_HOST ||
-      address.family !== "IPv4" ||
-      address.port !== port
-    ) {
-      throw new Error(
-        "Managed Codex credential ownership listener bound unexpectedly",
-      );
-    }
-    const competingEndpoints = await Promise.all(
-      ports
-        .filter((candidatePort) => candidatePort !== port)
-        .map((candidatePort) => probeCredentialLease(candidatePort, identity)),
-    );
-    if (
-      competingEndpoints.some(
-        (probe) =>
-          probe === "matching_owner" || probe === "unresponsive",
-      )
-    ) {
-      throw new Error(
-        "Managed Codex credential home already has an active lease",
-      );
-    }
-    if (await hasActiveCredentialLeaseMarker(home, identity, ports)) {
-      throw new Error(
-        "Managed Codex credential home already has an active lease",
-      );
-    }
-    if (invalid !== null || !server.listening) {
-      throw new Error("Managed Codex credential ownership was lost", {
-        cause: invalid,
+      server.on("error", (error) => {
+        invalid ??= error;
       });
+      server.on("close", () => {
+        if (!released) {
+          invalid ??= new Error(
+            "Managed Codex credential ownership listener closed unexpectedly",
+          );
+        }
+      });
+      servers.push(server);
+      if (servers.length === CREDENTIAL_LEASE_QUORUM) break;
+    }
+    if (servers.length !== CREDENTIAL_LEASE_QUORUM) {
+      throw new Error(
+        "Managed Codex credential home already has an active lease",
+      );
     }
   } catch (error) {
-    expectedClose = true;
-    for (const socket of acceptedSockets) socket.destroy();
-    if (server.listening) await closeCredentialLeaseServer(server);
+    released = true;
+    await Promise.allSettled(servers.map(closeCredentialLeaseServer));
     throw error;
   }
 
-  const markerPath = await publishCredentialLeaseMarker(home, {
-    version: 1,
-    identity,
-    pid: process.pid,
-    port,
-    token: randomBytes(16).toString("hex"),
-  }).catch(async (error: unknown) => {
-    expectedClose = true;
-    for (const socket of acceptedSockets) socket.destroy();
-    if (server.listening) await closeCredentialLeaseServer(server);
-    throw new Error(
-      "Managed Codex credential ownership marker could not be established",
-      { cause: error },
-    );
-  });
-
-  let released = false;
-  let releaseAttempt: Promise<void> | null = null;
   return Object.freeze({
     assertHeld(): void {
-      if (released || invalid !== null || !server.listening) {
-        throw new Error("Managed Codex credential ownership was lost", {
-          cause: invalid,
-        });
+      if (
+        released ||
+        invalid !== null ||
+        servers.filter((server) => server.listening).length <
+          CREDENTIAL_LEASE_QUORUM
+      ) {
+        throw new Error("Managed Codex credential ownership was lost");
       }
     },
     async release(): Promise<void> {
       if (released) return;
-      if (releaseAttempt !== null) return await releaseAttempt;
-      const attempt = (async () => {
-        const ownershipError = invalid;
-        // Keep the kernel fence live until its marker is gone. If unlinking
-        // the marker fails, quarantine recovery can still assert ownership
-        // and retry instead of inheriting a closed, permanently unusable
-        // lock.
-        await unlink(markerPath).catch((error: unknown) => {
-          if (errorCode(error) !== "ENOENT") throw error;
-        });
-        expectedClose = true;
-        for (const socket of acceptedSockets) socket.destroy();
-        if (server.listening) await closeCredentialLeaseServer(server);
-        released = true;
-        if (ownershipError !== null) throw ownershipError;
-      })();
-      releaseAttempt = attempt;
-      try {
-        await attempt;
-      } finally {
-        if (releaseAttempt === attempt) releaseAttempt = null;
+      const outcomes = await Promise.allSettled(
+        servers.map(closeCredentialLeaseServer),
+      );
+      const listenersStillHeld = servers.filter(
+        (server) => server.listening,
+      ).length;
+      if (listenersStillHeld >= CREDENTIAL_LEASE_QUORUM) {
+        const failure = outcomes.find(
+          (outcome): outcome is PromiseRejectedResult =>
+            outcome.status === "rejected",
+        );
+        throw new Error(
+          "Managed Codex credential ownership could not be released",
+          { cause: failure?.reason },
+        );
       }
+      // Once fewer than two listeners remain, quorum authority is gone. Never
+      // throw after that point: a stale quarantine must not touch a successor.
+      released = true;
     },
   });
 }
 
-function credentialLeaseIdentity(home: string): string {
-  const scope = `${
-    typeof process.getuid === "function" ? process.getuid() : "win32"
-  }\0${home}`;
-  return createHash("sha256").update(scope).digest("hex");
-}
-
-function credentialLeasePorts(home: string): number[] {
-  const digest = Buffer.from(credentialLeaseIdentity(home), "hex");
+function credentialLeasePorts(home: string): readonly number[] {
+  const userScope =
+    typeof process.getuid === "function" ? String(process.getuid()) : "win32";
+  const digest = createHash("sha256")
+    .update("paperclip-managed-codex-lease-v2:")
+    .update(userScope)
+    .update("\0")
+    .update(home)
+    .digest();
   const start = digest.readUInt16BE(0) % CREDENTIAL_LEASE_PORT_COUNT;
-  const stride = digest.readUInt16BE(2) | 1;
+  const step = (digest.readUInt16BE(2) | 1) % CREDENTIAL_LEASE_PORT_COUNT;
   return Array.from(
-    { length: MAX_CREDENTIAL_LEASE_PORT_CANDIDATES },
+    { length: CREDENTIAL_LEASE_CANDIDATES },
     (_, index) =>
       CREDENTIAL_LEASE_PORT_MIN +
-      ((start + index * stride) % CREDENTIAL_LEASE_PORT_COUNT),
+      ((start + index * step) % CREDENTIAL_LEASE_PORT_COUNT),
   );
-}
-
-function createCredentialLeaseServer(
-  identity: string,
-  acceptedSockets: Set<Socket>,
-): Server {
-  const response = `${CREDENTIAL_LEASE_PROTOCOL} ${identity}\n`;
-  return createServer((socket) => {
-    acceptedSockets.add(socket);
-    socket.once("close", () => acceptedSockets.delete(socket));
-    socket.end(response);
-  });
-}
-
-async function probeCredentialLease(
-  port: number,
-  expectedIdentity: string,
-): Promise<CredentialLeaseProbe> {
-  const processIdentity = processCredentialLeaseIdentities.get(port);
-  if (processIdentity !== undefined) {
-    return processIdentity === expectedIdentity
-      ? "matching_owner"
-      : "different_owner";
-  }
-  const expected = `${CREDENTIAL_LEASE_PROTOCOL} ${expectedIdentity}\n`;
-  return await new Promise<CredentialLeaseProbe>((resolveProbe) => {
-    const socket = createConnection({ host: CREDENTIAL_LEASE_HOST, port });
-    let settled = false;
-    let response = "";
-    let foreignProbe: NodeJS.Timeout | null = null;
-    const finish = (result: CredentialLeaseProbe): void => {
-      if (settled) return;
-      settled = true;
-      if (foreignProbe !== null) clearTimeout(foreignProbe);
-      socket.destroy();
-      resolveProbe(result);
-    };
-    socket.setEncoding("utf8");
-    socket.setTimeout(CREDENTIAL_LEASE_PROBE_TIMEOUT_MS, () =>
-      finish("unresponsive"),
-    );
-    socket.once("connect", () => {
-      foreignProbe = setTimeout(() => {
-        if (!settled) socket.write(CREDENTIAL_LEASE_FOREIGN_PROBE);
-      }, 10);
-      foreignProbe.unref();
-    });
-    socket.on("data", (chunk: string) => {
-      response += chunk;
-      if (response === expected) finish("matching_owner");
-      else if (
-        response.length >= expected.length ||
-        !expected.startsWith(response)
-      ) {
-        finish("different_owner");
-      }
-    });
-    socket.once("error", (error) =>
-      finish(
-        errorCode(error) === "ECONNREFUSED"
-          ? "unoccupied"
-          : "unresponsive",
-      ),
-    );
-    socket.once("end", () =>
-      finish(response === expected ? "matching_owner" : "different_owner"),
-    );
-    socket.once("close", () =>
-      finish(response === expected ? "matching_owner" : "different_owner"),
-    );
-  });
-}
-
-async function hasActiveCredentialLeaseMarker(
-  home: string,
-  expectedIdentity: string,
-  candidatePorts: readonly number[],
-): Promise<boolean> {
-  const entries = (await readdir(home, { withFileTypes: true })).filter(
-    (entry) =>
-      entry.isFile() &&
-      entry.name.startsWith(CREDENTIAL_LEASE_MARKER_PREFIX) &&
-      entry.name.endsWith(".json"),
-  );
-  if (entries.length > MAX_CREDENTIAL_LEASE_MARKERS) {
-    throw new Error("Managed Codex credential lease marker limit exceeded");
-  }
-  for (const entry of entries) {
-    const markerPath = join(home, entry.name);
-    const marker = await readCredentialLeaseMarker(markerPath);
-    if (
-      marker === null ||
-      marker.identity !== expectedIdentity ||
-      !candidatePorts.includes(marker.port)
-    ) {
-      continue;
-    }
-    if (
-      (await probeCredentialLease(marker.port, expectedIdentity)) ===
-      "matching_owner"
-    ) {
-      return true;
-    }
-    if (
-      credentialLeaseProcessIsAlive(marker.pid) &&
-      (await credentialLeasePortIsOccupied(marker.port))
-    ) {
-      return true;
-    }
-    await unlink(markerPath).catch((error: unknown) => {
-      if (errorCode(error) !== "ENOENT") throw error;
-    });
-  }
-  return false;
-}
-
-async function readCredentialLeaseMarker(
-  markerPath: string,
-): Promise<CredentialLeaseMarker | null> {
-  let handle: FileHandle;
-  try {
-    handle = await open(
-      markerPath,
-      constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
-    );
-  } catch (error) {
-    if (errorCode(error) === "ENOENT" || errorCode(error) === "ELOOP") {
-      return null;
-    }
-    throw error;
-  }
-  try {
-    const metadata = await handle.stat();
-    if (!metadata.isFile() || metadata.size < 1 || metadata.size > 4_096) {
-      return null;
-    }
-    const bytes = await readHandle(handle, metadata.size);
-    const value = JSON.parse(bytes.toString("utf8")) as Partial<CredentialLeaseMarker>;
-    if (
-      value.version !== 1 ||
-      typeof value.identity !== "string" ||
-      !/^[0-9a-f]{64}$/.test(value.identity) ||
-      !Number.isInteger(value.pid) ||
-      (value.pid ?? 0) < 1 ||
-      !Number.isInteger(value.port) ||
-      (value.port ?? 0) < 1 ||
-      (value.port ?? 0) > 65_535 ||
-      typeof value.token !== "string" ||
-      !/^[0-9a-f]{32}$/.test(value.token)
-    ) {
-      return null;
-    }
-    return value as CredentialLeaseMarker;
-  } catch {
-    return null;
-  } finally {
-    await handle.close();
-  }
-}
-
-async function publishCredentialLeaseMarker(
-  home: string,
-  marker: CredentialLeaseMarker,
-): Promise<string> {
-  const markerPath = join(
-    home,
-    `${CREDENTIAL_LEASE_MARKER_PREFIX}${marker.token}.json`,
-  );
-  const handle = await open(
-    markerPath,
-    constants.O_WRONLY |
-      constants.O_CREAT |
-      constants.O_EXCL |
-      (constants.O_NOFOLLOW ?? 0),
-    PRIVATE_FILE_MODE,
-  );
-  try {
-    await handle.writeFile(`${JSON.stringify(marker)}\n`, "utf8");
-    await handle.sync();
-  } catch (error) {
-    await handle.close().catch(() => undefined);
-    await unlink(markerPath).catch(() => undefined);
-    throw error;
-  }
-  await handle.close();
-  return markerPath;
-}
-
-function credentialLeaseProcessIsAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return errorCode(error) !== "ESRCH";
-  }
-}
-
-async function credentialLeasePortIsOccupied(port: number): Promise<boolean> {
-  const probe = createServer();
-  try {
-    await listenForCredentialLease(probe, port);
-    await closeCredentialLeaseServer(probe);
-    return false;
-  } catch (error) {
-    if (errorCode(error) === "EADDRINUSE") return true;
-    throw error;
-  }
 }
 
 async function listenForCredentialLease(
@@ -670,32 +397,34 @@ async function listenForCredentialLease(
   port: number,
 ): Promise<void> {
   await new Promise<void>((resolveListen, rejectListen) => {
-    const onError = (error: Error): void => rejectListen(error);
+    const onError = (error: Error): void => {
+      server.off("listening", onListening);
+      rejectListen(error);
+    };
+    const onListening = (): void => {
+      server.off("error", onError);
+      resolveListen();
+    };
     server.once("error", onError);
-    server.listen(
-      {
-        host: CREDENTIAL_LEASE_HOST,
-        port,
-        exclusive: true,
-        reusePort: false,
-      },
-      () => {
-        server.off("error", onError);
-        resolveListen();
-      },
-    );
+    server.once("listening", onListening);
+    server.listen({
+      exclusive: true,
+      host: CREDENTIAL_LEASE_HOST,
+      port,
+    });
   });
 }
 
 async function closeCredentialLeaseServer(server: Server): Promise<void> {
+  if (!server.listening) return;
   await new Promise<void>((resolveClose, rejectClose) => {
     server.close((error) => {
       if (error) rejectClose(error);
       else resolveClose();
     });
+    server.closeAllConnections();
   });
 }
-
 function quarantineCredentialCleanup(
   path: string,
   home: string,
@@ -733,13 +462,13 @@ function startCredentialCleanupRecovery(
         // after kernel ownership has been lost.
         assertCredentialCleanupAuthority(cleanup);
         await removeReplaceableCredential(cleanup.path);
+        await removeReplaceableCredential(
+          join(cleanup.home, CREDENTIAL_STAGING_FILE),
+        );
         assertCredentialCleanupAuthority(cleanup);
         await syncDirectory(cleanup.home);
         assertCredentialCleanupAuthority(cleanup);
-        await removeCredentialCleanupIntent(
-          cleanup.intentPath,
-          cleanup.home,
-        );
+        await removeCredentialCleanupIntent(cleanup.intentPath, cleanup.home);
         assertCredentialCleanupAuthority(cleanup);
         await cleanup.lock.release();
         quarantinedCredentialCleanups.delete(cleanup.home);
@@ -755,9 +484,11 @@ function startCredentialCleanupRecovery(
     }
   })();
   cleanup.recovery = recovery;
-  void recovery.finally(() => {
-    if (cleanup.recovery === recovery) cleanup.recovery = null;
-  }).catch(() => undefined);
+  void recovery
+    .finally(() => {
+      if (cleanup.recovery === recovery) cleanup.recovery = null;
+    })
+    .catch(() => undefined);
   return recovery;
 }
 
@@ -795,11 +526,12 @@ async function recoverQuarantinedCredentialCleanup(
 
 async function recoverPersistedCredentialCleanup(
   path: string,
+  stagingPath: string,
   home: string,
   intentPath: string,
 ): Promise<void> {
   if (!(await pathExists(intentPath))) return;
-  await removeCredential(path, home);
+  await removeCredentialArtifacts([path, stagingPath], home);
   await removeCredentialCleanupIntent(intentPath, home);
 }
 
@@ -1000,13 +732,10 @@ function validateCredentialDocument(bytes: Buffer): void {
 
 async function writeCredential(
   destination: string,
+  temporaryPath: string,
   home: string,
   bytes: Buffer,
 ): Promise<void> {
-  const temporaryPath = join(
-    home,
-    `.auth.json.tmp-${randomBytes(12).toString("hex")}`,
-  );
   let handle: FileHandle;
   try {
     handle = await open(
@@ -1066,14 +795,15 @@ async function removeReplaceableCredential(path: string): Promise<void> {
 }
 
 async function removeCredential(path: string, home: string): Promise<void> {
-  try {
-    const metadata = await lstat(path);
-    if (metadata.isDirectory() && !metadata.isSymbolicLink()) {
-      throw new Error("Managed Codex credential destination is a directory");
-    }
-    await unlink(path);
-  } catch (error) {
-    if (errorCode(error) !== "ENOENT") throw error;
+  await removeCredentialArtifacts([path], home);
+}
+
+async function removeCredentialArtifacts(
+  paths: readonly string[],
+  home: string,
+): Promise<void> {
+  for (const path of paths) {
+    await removeReplaceableCredential(path);
   }
   // Sync even after ENOENT: a previous unlink may have succeeded before its
   // directory sync failed. Never report cleanup or finish preflight while the
@@ -1094,7 +824,8 @@ async function syncDirectoryDurably(directory: string): Promise<void> {
       lastError = error;
       if (
         attempt === MAX_DIRECTORY_SYNC_ATTEMPTS ||
-        error instanceof DirectorySyncOperationTimeoutError
+        error instanceof DirectorySyncOperationTimeoutError ||
+        error instanceof PermanentDirectorySyncHelperError
       ) {
         break;
       }
@@ -1115,75 +846,104 @@ async function syncDirectoryDurably(directory: string): Promise<void> {
 
 async function syncDirectory(directory: string): Promise<void> {
   if (process.platform === "win32") return;
-  // A timed-out fsync cannot be cancelled, and FileHandle.close() cannot
-  // finish ahead of it. Do not open another handle for this directory until
-  // the one outstanding operation and its close have settled.
-  if (pendingDirectorySyncCleanups.has(directory)) {
-    throw new DirectorySyncOperationTimeoutError("fsync", directory);
+  // Once an in-process filesystem request times out it cannot be cancelled.
+  // Keep that single request observed, and permanently use killable helper
+  // processes for this home so recovery remains available without accumulating
+  // additional parent-process handles or requests.
+  if (isolatedDirectorySyncHomes.has(directory)) {
+    if (failedIsolatedDirectorySyncHomes.has(directory)) {
+      throw new PermanentDirectorySyncHelperError(directory);
+    }
+    await syncDirectoryInIsolatedProcess(directory);
+    return;
   }
-  const openAttempt = open(
-    directory,
-    constants.O_RDONLY | (constants.O_DIRECTORY ?? 0),
-  );
-  let handle: FileHandle;
+  const parentOperation = reserveParentDirectorySyncOperation();
+  if (parentOperation === null) {
+    // Never start a fifth uncancellable parent filesystem request. The helper
+    // pool has its own global bound and can be killed independently.
+    isolatedDirectorySyncHomes.add(directory);
+    await syncDirectoryInIsolatedProcess(directory);
+    return;
+  }
+  let retainParentOperation = false;
   try {
-    handle = await waitForDirectorySyncOperation(
-      openAttempt,
-      "open",
+    const openAttempt = open(
       directory,
+      constants.O_RDONLY | (constants.O_DIRECTORY ?? 0),
     );
-  } catch (error) {
-    if (error instanceof DirectorySyncOperationTimeoutError) {
-      // open(2) cannot be cancelled. If the kernel eventually returns a
-      // handle after our retry budget has advanced, close it without keeping
-      // another open from racing the unresolved request or its late close.
-      const cleanupAttempt = openAttempt.then(
-        (lateHandle) => closeDirectoryHandle(lateHandle, directory),
-        () => undefined,
+    let handle: FileHandle;
+    try {
+      handle = await waitForDirectorySyncOperation(
+        openAttempt,
+        "open",
+        directory,
       );
-      retainDirectorySyncCleanup(directory, cleanupAttempt);
+    } catch (error) {
+      if (error instanceof DirectorySyncOperationTimeoutError) {
+        // open(2) cannot be cancelled. Retain this process-global reservation
+        // for the process lifetime and observe/close a late handle without
+        // ever starting another parent request for this home.
+        retainParentOperation = true;
+        const cleanupAttempt = openAttempt.then(
+          (lateHandle) => closeDirectoryHandle(lateHandle, directory),
+          () => undefined,
+        );
+        retainDirectorySyncCleanup(directory, cleanupAttempt);
+        isolatedDirectorySyncHomes.add(directory);
+        await syncDirectoryInIsolatedProcess(directory);
+        return;
+      }
+      throw error;
     }
-    throw error;
-  }
 
-  let syncAttempt: Promise<void>;
-  try {
-    syncAttempt = handle.sync();
-  } catch (error) {
-    await closeDirectoryHandle(handle, directory);
-    throw error;
-  }
-  let syncTimedOut = false;
-  try {
-    await waitForDirectorySyncOperation(syncAttempt, "fsync", directory);
-  } catch (error) {
-    syncTimedOut = error instanceof DirectorySyncOperationTimeoutError;
-    if (syncTimedOut) {
-      // FileHandle.close() waits for outstanding operations. Retain one
-      // process-wide cleanup barrier for this directory so retries fail
-      // closed without accumulating handles or filesystem requests. Use the
-      // actual close promise here: the barrier must remain until the resource
-      // is really released, not merely until the bounded close observer gives
-      // up waiting.
-      const cleanupAttempt = syncAttempt.then(
-        () => handle.close().catch(() => undefined),
-        () => handle.close().catch(() => undefined),
-      );
-      retainDirectorySyncCleanup(directory, cleanupAttempt);
+    let syncAttempt: Promise<void>;
+    try {
+      syncAttempt = handle.sync();
+    } catch (error) {
+      retainParentOperation = await closeDirectoryHandle(handle, directory);
+      throw error;
     }
-    throw error;
+    let syncTimedOut = false;
+    try {
+      await waitForDirectorySyncOperation(syncAttempt, "fsync", directory);
+    } catch (error) {
+      syncTimedOut = error instanceof DirectorySyncOperationTimeoutError;
+      if (syncTimedOut) {
+        // FileHandle.close() waits for outstanding operations. Retain both the
+        // cleanup observer and the parent-operation slot for process lifetime.
+        retainParentOperation = true;
+        const cleanupAttempt = syncAttempt.then(
+          () => handle.close().catch(() => undefined),
+          () => handle.close().catch(() => undefined),
+        );
+        retainDirectorySyncCleanup(directory, cleanupAttempt);
+        isolatedDirectorySyncHomes.add(directory);
+        await syncDirectoryInIsolatedProcess(directory);
+        return;
+      }
+      throw error;
+    } finally {
+      // A completed fsync is the durability boundary. Close is resource
+      // cleanup; a timed-out close retains the global parent-operation slot.
+      if (!syncTimedOut) {
+        retainParentOperation =
+          (await closeDirectoryHandle(handle, directory)) ||
+          retainParentOperation;
+      }
+    }
   } finally {
-    // A completed fsync is the durability boundary. Close is resource cleanup:
-    // bound and detach it rather than turning durable state into a failure or
-    // masking the original fsync error.
-    if (!syncTimedOut) await closeDirectoryHandle(handle, directory);
+    if (!retainParentOperation) {
+      directorySyncHelperRegistry.activeParentOperations.delete(
+        parentOperation,
+      );
+    }
   }
 }
 
 async function closeDirectoryHandle(
   handle: FileHandle,
   directory: string,
-): Promise<void> {
+): Promise<boolean> {
   try {
     const closeAttempt = handle.close();
     try {
@@ -1194,6 +954,8 @@ async function closeDirectoryHandle(
       // the real close settles, while a completed fsync stays successful.
       if (error instanceof DirectorySyncOperationTimeoutError) {
         retainDirectorySyncCleanup(directory, closeAttempt);
+        isolatedDirectorySyncHomes.add(directory);
+        return true;
       } else {
         void closeAttempt.catch(() => undefined);
       }
@@ -1202,6 +964,156 @@ async function closeDirectoryHandle(
     // Closing cannot invalidate an fsync that already completed, and callers
     // with a failed fsync must retain that original durability error.
   }
+  return false;
+}
+
+function reserveParentDirectorySyncOperation(): symbol | null {
+  if (
+    directorySyncHelperRegistry.activeParentOperations.size >=
+    MAX_PARENT_DIRECTORY_SYNC_OPERATIONS
+  ) {
+    return null;
+  }
+  const reservation = Symbol("parent-directory-sync");
+  directorySyncHelperRegistry.activeParentOperations.add(reservation);
+  return reservation;
+}
+
+async function syncDirectoryInIsolatedProcess(
+  directory: string,
+): Promise<void> {
+  if (failedIsolatedDirectorySyncHomes.has(directory)) {
+    throw new PermanentDirectorySyncHelperError(directory);
+  }
+  const activeAttempt = isolatedDirectorySyncAttempts.get(directory);
+  if (activeAttempt !== undefined) return await activeAttempt;
+  const attempt = runDirectorySyncHelper(directory);
+  isolatedDirectorySyncAttempts.set(directory, attempt);
+  try {
+    await attempt;
+  } finally {
+    if (isolatedDirectorySyncAttempts.get(directory) === attempt) {
+      isolatedDirectorySyncAttempts.delete(directory);
+    }
+  }
+}
+
+async function runDirectorySyncHelper(directory: string): Promise<void> {
+  if (
+    directorySyncHelperRegistry.activeChildren.size >=
+    MAX_DIRECTORY_SYNC_HELPERS
+  ) {
+    throw new Error(
+      `Managed Codex credential directory helper process limit of ${MAX_DIRECTORY_SYNC_HELPERS} was reached`,
+    );
+  }
+  let child: ChildProcess;
+  try {
+    child = spawn(
+      process.execPath,
+      [
+        "--input-type=module",
+        "--eval",
+        DIRECTORY_SYNC_HELPER_SOURCE,
+        directory,
+      ],
+      {
+        // The helper imports only Node built-ins. Do not inherit loader hooks or
+        // any credential-bearing process environment into the durability worker.
+        env: {},
+        stdio: "ignore",
+        windowsHide: true,
+      },
+    );
+    directorySyncHelperRegistry.activeChildren.add(child);
+    child.unref();
+  } catch {
+    failedIsolatedDirectorySyncHomes.add(directory);
+    throw new PermanentDirectorySyncHelperError(directory);
+  }
+  await new Promise<void>((resolveHelper, rejectHelper) => {
+    let timeout: NodeJS.Timeout | undefined;
+    let killAcknowledgementTimeout: NodeJS.Timeout | undefined;
+    let timedOut = false;
+    let settled = false;
+    let reaped = false;
+    const settle = (error?: Error): void => {
+      if (settled) return;
+      settled = true;
+      if (timeout !== undefined) clearTimeout(timeout);
+      if (killAcknowledgementTimeout !== undefined) {
+        clearTimeout(killAcknowledgementTimeout);
+      }
+      if (error === undefined) resolveHelper();
+      else rejectHelper(error);
+    };
+    const reap = (): void => {
+      if (reaped) return;
+      reaped = true;
+      directorySyncHelperRegistry.activeChildren.delete(child);
+      if (stuckDirectorySyncHelpers.get(directory) === child) {
+        stuckDirectorySyncHelpers.delete(directory);
+      }
+      child.off("error", onError);
+      child.off("exit", onExit);
+      child.off("close", onClose);
+    };
+    const fencePermanently = (): void => {
+      failedIsolatedDirectorySyncHomes.add(directory);
+      stuckDirectorySyncHelpers.set(directory, child);
+      settle(new PermanentDirectorySyncHelperError(directory));
+    };
+    const onError = (): void => {
+      fencePermanently();
+      // A missing pid proves spawn never created a process, so no retained
+      // reaper or global capacity slot is necessary.
+      if (child.pid === undefined) reap();
+    };
+    const onExit = (
+      code: number | null,
+      signal: NodeJS.Signals | null,
+    ): void => {
+      reap();
+      if (timedOut) {
+        settle(new DirectorySyncOperationTimeoutError("helper", directory));
+      } else if (code === 0) {
+        settle();
+      } else {
+        settle(
+          new Error(
+            `Managed Codex credential directory helper failed with ${
+              signal === null ? `code ${String(code)}` : `signal ${signal}`
+            }`,
+          ),
+        );
+      }
+    };
+    const onClose = (): void => reap();
+    child.on("error", onError);
+    child.once("exit", onExit);
+    child.once("close", onClose);
+    timeout = setTimeout(() => {
+      timedOut = true;
+      // Wait for the exit event after SIGKILL before permitting another helper;
+      // this is the resource-release acknowledgement the in-process API lacks.
+      try {
+        if (!child.kill("SIGKILL")) {
+          fencePermanently();
+          return;
+        }
+        killAcknowledgementTimeout = setTimeout(() => {
+          // A child that does not acknowledge SIGKILL is retained as the sole
+          // reaper for this home. Permanently fail closed so no later attempt
+          // can accumulate another possibly stuck process.
+          fencePermanently();
+        }, DIRECTORY_SYNC_HELPER_KILL_ACK_TIMEOUT_MS);
+        killAcknowledgementTimeout.unref?.();
+      } catch {
+        fencePermanently();
+      }
+    }, DIRECTORY_SYNC_OPERATION_TIMEOUT_MS);
+    timeout.unref?.();
+  });
 }
 
 function retainDirectorySyncCleanup(
@@ -1228,11 +1140,23 @@ function retainDirectorySyncCleanup(
 }
 
 class DirectorySyncOperationTimeoutError extends Error {
-  constructor(operation: "open" | "fsync" | "close", directory: string) {
+  constructor(
+    operation: "open" | "fsync" | "close" | "helper",
+    directory: string,
+  ) {
     super(
       `Managed Codex credential directory ${operation} timed out after ${DIRECTORY_SYNC_OPERATION_TIMEOUT_MS}ms for ${directory}`,
     );
     this.name = "DirectorySyncOperationTimeoutError";
+  }
+}
+
+class PermanentDirectorySyncHelperError extends Error {
+  constructor(directory: string) {
+    super(
+      `Managed Codex credential directory helper termination was not acknowledged and is permanently unavailable for ${directory}`,
+    );
+    this.name = "PermanentDirectorySyncHelperError";
   }
 }
 

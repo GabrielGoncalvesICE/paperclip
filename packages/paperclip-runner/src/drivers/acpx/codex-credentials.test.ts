@@ -1,10 +1,12 @@
 import { fork, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
+import { EventEmitter } from "node:events";
 import {
   chmod,
   mkdir,
   mkdtemp,
   open,
+  readdir,
   readFile,
   realpath,
   rm,
@@ -13,7 +15,8 @@ import {
   writeFile,
   type FileHandle,
 } from "node:fs/promises";
-import { createServer } from "node:net";
+import { createRequire } from "node:module";
+import { createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -25,8 +28,16 @@ const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
   vi.useRealTimers();
+  vi.doUnmock("node:child_process");
   vi.doUnmock("node:fs/promises");
   vi.resetModules();
+  (
+    globalThis as typeof globalThis & {
+      __paperclipDirectorySyncHelperRegistryV1?: {
+        activeParentOperations: Set<symbol>;
+      };
+    }
+  ).__paperclipDirectorySyncHelperRegistryV1?.activeParentOperations.clear();
   await Promise.all(
     temporaryDirectories
       .splice(0)
@@ -35,6 +46,18 @@ afterEach(async () => {
 });
 
 describe("managed Codex credentials", () => {
+  it("derives deterministic quorum candidates from distinct user scopes", () => {
+    expect(credentialLeasePortsForScope("1000", "/canonical/home")).toEqual(
+      credentialLeasePortsForScope("1000", "/canonical/home"),
+    );
+    expect(credentialLeasePortsForScope("1000", "/canonical/home")).not.toEqual(
+      credentialLeasePortsForScope("1001", "/canonical/home"),
+    );
+    expect(credentialLeasePortsForScope("1000", "/canonical/home")).not.toEqual(
+      credentialLeasePortsForScope("1000", "/canonical/other-home"),
+    );
+  });
+
   it("stages inline JSON privately and removes it idempotently", async () => {
     const fixture = await credentialFixture();
     const lease = await stageManagedCodexCredential({
@@ -104,216 +127,199 @@ describe("managed Codex credentials", () => {
     await secondLease.close();
   });
 
-  it("falls through when an unrelated listener occupies the primary lease port", async () => {
+  it("fences a contender loaded through a fresh module instance", async () => {
     const fixture = await credentialFixture();
-    const canonicalHome = await realpath(fixture.home);
-    const primaryPort = credentialLeasePrimaryPort(canonicalHome);
-    const unrelated = createServer((socket) => {
-      socket.end("unrelated-loopback-service\n");
-    });
-    await new Promise<void>((resolveListen, rejectListen) => {
-      unrelated.once("error", rejectListen);
-      unrelated.listen(primaryPort, "127.0.0.1", resolveListen);
+    const firstLease = await stageManagedCodexCredential({
+      agentHomeDirectory: fixture.home,
+      environment: {
+        PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: '{"owner":"first"}',
+      },
     });
 
-    try {
-      const lease = await stageManagedCodexCredential({
+    vi.resetModules();
+    const freshCredentials = await import("./codex-credentials.js");
+    await expect(
+      freshCredentials.stageManagedCodexCredential({
         agentHomeDirectory: fixture.home,
         environment: {
-          PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: '{"owner":"paperclip"}',
+          PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: '{"owner":"contender"}',
         },
-      });
-      await expect(readFile(lease.path, "utf8")).resolves.toBe(
-        '{"owner":"paperclip"}',
-      );
-      vi.resetModules();
-      const freshCredentials = await import("./codex-credentials.js");
-      await expect(
-        freshCredentials.stageManagedCodexCredential({
-          agentHomeDirectory: fixture.home,
-          environment: {
-            PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: '{"owner":"contender"}',
-          },
-        }),
-      ).rejects.toThrow("already has an active lease");
-      await lease.close();
+      }),
+    ).rejects.toThrow("already has an active lease");
 
-      const successor = await freshCredentials.stageManagedCodexCredential({
-        agentHomeDirectory: fixture.home,
-        environment: {
-          PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: '{"owner":"successor"}',
-        },
-      });
-      await expect(readFile(successor.path, "utf8")).resolves.toBe(
-        '{"owner":"successor"}',
-      );
-      await successor.close();
-    } finally {
-      await new Promise<void>((resolveClose, rejectClose) => {
-        unrelated.close((error) => {
-          if (error) rejectClose(error);
-          else resolveClose();
-        });
-      });
-    }
+    await firstLease.close();
   });
 
-  it("fails closed while the primary lease owner is not yet responsive", async () => {
-    const fixture = await credentialFixture();
-    const canonicalHome = await realpath(fixture.home);
-    const primaryPort = credentialLeasePrimaryPort(canonicalHome);
-    const acceptedSockets = new Set<import("node:net").Socket>();
-    const publishingOwner = createServer((socket) => {
-      acceptedSockets.add(socket);
-      socket.once("close", () => acceptedSockets.delete(socket));
-      socket.pause();
-    });
-    await new Promise<void>((resolveListen, rejectListen) => {
-      publishingOwner.once("error", rejectListen);
-      publishingOwner.listen(primaryPort, "127.0.0.1", resolveListen);
-    });
-
-    try {
-      await expect(
-        stageManagedCodexCredential({
-          agentHomeDirectory: fixture.home,
-          environment: {
-            PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: '{"owner":"contender"}',
-          },
-        }),
-      ).rejects.toThrow(
-        "could not safely bypass an unresponsive lease endpoint",
-      );
-      await expect(
-        readFile(join(fixture.home, "auth.json")),
-      ).rejects.toMatchObject({ code: "ENOENT" });
-    } finally {
-      for (const socket of acceptedSockets) socket.destroy();
-      await new Promise<void>((resolveClose, rejectClose) => {
-        publishingOwner.close((error) => {
-          if (error) rejectClose(error);
-          else resolveClose();
-        });
-      });
-    }
-  });
-
-  it("fails closed when a competing candidate is unresponsive after bind", async () => {
-    const fixture = await credentialFixture();
-    const canonicalHome = await realpath(fixture.home);
-    const competingPort = credentialLeasePort(canonicalHome, 1);
-    const acceptedSockets = new Set<import("node:net").Socket>();
-    const publishingOwner = createServer((socket) => {
-      acceptedSockets.add(socket);
-      socket.once("close", () => acceptedSockets.delete(socket));
-      socket.pause();
-    });
-    await new Promise<void>((resolveListen, rejectListen) => {
-      publishingOwner.once("error", rejectListen);
-      publishingOwner.listen(competingPort, "127.0.0.1", resolveListen);
-    });
-
-    try {
-      await expect(
-        stageManagedCodexCredential({
-          agentHomeDirectory: fixture.home,
-          environment: {
-            PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: '{"owner":"contender"}',
-          },
-        }),
-      ).rejects.toThrow("already has an active lease");
-      await expect(
-        readFile(join(fixture.home, "auth.json")),
-      ).rejects.toMatchObject({ code: "ENOENT" });
-    } finally {
-      for (const socket of acceptedSockets) socket.destroy();
-      await new Promise<void>((resolveClose, rejectClose) => {
-        publishingOwner.close((error) => {
-          if (error) rejectClose(error);
-          else resolveClose();
-        });
-      });
-    }
-  });
-
-  it(
-    "fences another process and recovers only after its kernel lease dies",
-    async () => {
+  it.each([
+    ["primary", 0],
+    ["non-primary", 1],
+  ] as const)(
+    "tolerates one unrelated silent %s quorum listener",
+    async (_label, occupiedIndex) => {
       const fixture = await credentialFixture();
-      const destination = join(fixture.home, "auth.json");
-      const childScript = join(fixture.root, "credential-owner.mjs");
-      const credentialModule = new URL(
-        "./codex-credentials.ts",
-        import.meta.url,
-      ).href;
-      await writeFile(
-        childScript,
-        [
-          `const { stageManagedCodexCredential } = await import(${JSON.stringify(credentialModule)});`,
-          "const lease = await stageManagedCodexCredential({",
-          "  agentHomeDirectory: process.argv[2],",
-          '  environment: { PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: \'{"owner":"first"}\' },',
-          "});",
-          'process.send?.({ type: "ready", path: lease.path });',
-          "process.on('message', async (message) => {",
-          "  if (message?.type !== 'close') return;",
-          "  await lease.close();",
-          "  process.exit(0);",
-          "});",
-        ].join("\n"),
-      );
-      const owner = fork(childScript, [fixture.home], {
-        execArgv: ["--import", "tsx"],
-        stdio: ["ignore", "pipe", "pipe", "ipc"],
-      });
+      const ports = credentialLeasePorts(await realpath(fixture.home));
+      const occupied = await listenSilently(ports[occupiedIndex]);
       try {
-        await waitForChildMessage(owner, "ready");
-        await expect(readFile(destination, "utf8")).resolves.toBe(
-          '{"owner":"first"}',
-        );
-
-        if (process.platform !== "win32") {
-          owner.kill("SIGSTOP");
-          await new Promise<void>((resolveSignal) =>
-            setTimeout(resolveSignal, 50),
-          );
-        }
-        await expect(
-          stageManagedCodexCredential({
-            agentHomeDirectory: fixture.home,
-            environment: {
-              PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: '{"owner":"second"}',
-            },
-          }),
-        ).rejects.toThrow("already has an active lease");
-        await expect(readFile(destination, "utf8")).resolves.toBe(
-          '{"owner":"first"}',
-        );
-
-        if (process.platform !== "win32") owner.kill("SIGCONT");
-        owner.kill(process.platform === "win32" ? undefined : "SIGKILL");
-        await waitForChildExit(owner);
-
-        const successor = await stageManagedCodexCredential({
+        const lease = await stageManagedCodexCredential({
           agentHomeDirectory: fixture.home,
           environment: {
-            PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: '{"owner":"second"}',
+            PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: '{"owner":"paperclip"}',
           },
         });
-        await expect(readFile(destination, "utf8")).resolves.toBe(
-          '{"owner":"second"}',
+        await expect(readFile(lease.path, "utf8")).resolves.toBe(
+          '{"owner":"paperclip"}',
         );
-        await successor.close();
+        await lease.close();
       } finally {
-        if (owner.exitCode === null && owner.signalCode === null) {
-          if (process.platform !== "win32") owner.kill("SIGCONT");
-          owner.kill(process.platform === "win32" ? undefined : "SIGKILL");
-          await waitForChildExit(owner).catch(() => undefined);
-        }
+        await occupied.close();
       }
     },
   );
 
+  it("fails before auth mutation when two quorum candidates are occupied", async () => {
+    const fixture = await credentialFixture();
+    const destination = join(fixture.home, "auth.json");
+    await writeFile(destination, '{"sentinel":true}', { mode: 0o600 });
+    const ports = credentialLeasePorts(await realpath(fixture.home));
+    const first = await listenSilently(ports[0]);
+    const second = await listenSilently(ports[1]);
+    try {
+      await expect(
+        stageManagedCodexCredential({
+          agentHomeDirectory: fixture.home,
+          environment: {
+            PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: '{"owner":"contender"}',
+          },
+        }),
+      ).rejects.toThrow("already has an active lease");
+      await expect(readFile(destination, "utf8")).resolves.toBe(
+        '{"sentinel":true}',
+      );
+    } finally {
+      await Promise.all([first.close(), second.close()]);
+    }
+  });
+
+  it("admits only one of two concurrent fresh-module contenders", async () => {
+    const fixture = await credentialFixture();
+    vi.resetModules();
+    const firstCredentials = await import("./codex-credentials.js");
+    vi.resetModules();
+    const secondCredentials = await import("./codex-credentials.js");
+
+    const results = await Promise.allSettled([
+      firstCredentials.stageManagedCodexCredential({
+        agentHomeDirectory: fixture.home,
+        environment: {
+          PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: '{"owner":"first"}',
+        },
+      }),
+      secondCredentials.stageManagedCodexCredential({
+        agentHomeDirectory: fixture.home,
+        environment: {
+          PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: '{"owner":"second"}',
+        },
+      }),
+    ]);
+    const winners = results.filter(
+      (
+        result,
+      ): result is PromiseFulfilledResult<
+        Awaited<ReturnType<typeof stageManagedCodexCredential>>
+      > => result.status === "fulfilled",
+    );
+    expect(winners).toHaveLength(1);
+    expect(
+      results.filter((result) => result.status === "rejected"),
+    ).toHaveLength(1);
+    await winners[0].value.close();
+  });
+
+  it("fences another process and recovers only after its kernel lease dies", async () => {
+    const fixture = await credentialFixture();
+    const destination = join(fixture.home, "auth.json");
+    const childScript = join(fixture.root, "credential-owner.mjs");
+    const credentialModule = new URL("./codex-credentials.ts", import.meta.url)
+      .href;
+    // paperclip-runner intentionally does not ship a TS runtime dependency.
+    // Resolve the existing monorepo dev loader from a workspace that declares
+    // it, instead of asking the child to resolve an undeclared bare package.
+    const tsxLoader = createRequire(
+      new URL("../../../../../server/package.json", import.meta.url),
+    ).resolve("tsx");
+    await writeFile(
+      childScript,
+      [
+        `const { stageManagedCodexCredential } = await import(${JSON.stringify(credentialModule)});`,
+        "const lease = await stageManagedCodexCredential({",
+        "  agentHomeDirectory: process.argv[2],",
+        '  environment: { PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: \'{"owner":"first"}\' },',
+        "});",
+        'process.send?.({ type: "ready", path: lease.path });',
+        "process.on('message', async (message) => {",
+        "  if (message?.type !== 'close') return;",
+        "  await lease.close();",
+        "  process.exit(0);",
+        "});",
+      ].join("\n"),
+    );
+    const owner = fork(childScript, [fixture.home], {
+      execArgv: ["--import", tsxLoader],
+      stdio: ["ignore", "pipe", "pipe", "ipc"],
+    });
+    try {
+      await waitForChildMessage(owner, "ready");
+      await expect(readFile(destination, "utf8")).resolves.toBe(
+        '{"owner":"first"}',
+      );
+
+      if (process.platform !== "win32") {
+        owner.kill("SIGSTOP");
+        await new Promise<void>((resolveSignal) =>
+          setTimeout(resolveSignal, 50),
+        );
+      }
+      await expect(
+        stageManagedCodexCredential({
+          agentHomeDirectory: fixture.home,
+          environment: {
+            PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: '{"owner":"second"}',
+          },
+        }),
+      ).rejects.toThrow("already has an active lease");
+      await expect(readFile(destination, "utf8")).resolves.toBe(
+        '{"owner":"first"}',
+      );
+
+      if (process.platform !== "win32") owner.kill("SIGCONT");
+      owner.kill(process.platform === "win32" ? undefined : "SIGKILL");
+      await waitForChildExit(owner);
+
+      const successor = await stageManagedCodexCredential({
+        agentHomeDirectory: fixture.home,
+        environment: {
+          PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: '{"owner":"second"}',
+        },
+      });
+      await expect(readFile(destination, "utf8")).resolves.toBe(
+        '{"owner":"second"}',
+      );
+      await successor.close();
+      expect(
+        (await readdir(fixture.home)).filter(
+          (name) =>
+            name.includes("paperclip-auth-lease") ||
+            name.includes("paperclip-auth-home-claim"),
+        ),
+      ).toEqual([]);
+    } finally {
+      if (owner.exitCode === null && owner.signalCode === null) {
+        if (process.platform !== "win32") owner.kill("SIGCONT");
+        owner.kill(process.platform === "win32" ? undefined : "SIGKILL");
+        await waitForChildExit(owner).catch(() => undefined);
+      }
+    }
+  });
   it.runIf(process.platform !== "win32")(
     "holds kernel ownership until credential cleanup is durable",
     async () => {
@@ -337,16 +343,16 @@ describe("managed Codex credentials", () => {
         signalCleanupStarted = resolveStarted;
       });
       let heldCleanup = false;
-      const syncSpy = vi.spyOn(prototype, "sync").mockImplementation(
-        async function (this: FileHandle): Promise<void> {
+      const syncSpy = vi
+        .spyOn(prototype, "sync")
+        .mockImplementation(async function (this: FileHandle): Promise<void> {
           if (!heldCleanup && (await this.stat()).isDirectory()) {
             heldCleanup = true;
             signalCleanupStarted();
             await cleanupGate;
           }
           await originalSync.call(this);
-        },
-      );
+        });
       try {
         const closing = lease.close();
         await cleanupStarted;
@@ -402,117 +408,23 @@ describe("managed Codex credentials", () => {
     await secondLease.close();
   });
 
-  it("fences successor admission while an older lock release fails", async () => {
+  it("leaves no ownership artifacts in the credential home", async () => {
     const fixture = await credentialFixture();
-    const actualFs = await vi.importActual<typeof import("node:fs/promises")>(
-      "node:fs/promises",
-    );
-    let markerUnlinkAttempts = 0;
-    let signalMarkerReleaseStarted!: () => void;
-    const markerReleaseStarted = new Promise<void>((resolveStarted) => {
-      signalMarkerReleaseStarted = resolveStarted;
-    });
-    let failMarkerRelease!: () => void;
-    const markerReleaseFailureGate = new Promise<void>((resolveFailure) => {
-      failMarkerRelease = resolveFailure;
-    });
-    vi.doMock("node:fs/promises", () => ({
-      ...actualFs,
-      unlink: async (path: Parameters<typeof actualFs.unlink>[0]) => {
-        if (String(path).includes(".paperclip-auth-lease-v1-")) {
-          markerUnlinkAttempts += 1;
-          if (markerUnlinkAttempts === 1) {
-            signalMarkerReleaseStarted();
-            await markerReleaseFailureGate;
-            throw Object.assign(new Error("injected marker unlink failure"), {
-              code: "EACCES",
-            });
-          }
-        }
-        await actualFs.unlink(path);
-      },
-    }));
-    vi.resetModules();
-    const freshCredentials = await import("./codex-credentials.js");
-    const firstLease = await freshCredentials.stageManagedCodexCredential({
+    const lease = await stageManagedCodexCredential({
       agentHomeDirectory: fixture.home,
-      environment: {
-        PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: '{"owner":"first"}',
-      },
+      environment: { OPENAI_API_KEY: "launch-only-key" },
     });
+    await lease.close();
 
-    const firstClose = firstLease.close();
-    try {
-      await markerReleaseStarted;
-      await expect(
-        freshCredentials.stageManagedCodexCredential({
-          agentHomeDirectory: fixture.home,
-          environment: {
-            PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: '{"owner":"overlap"}',
-          },
-        }),
-      ).rejects.toThrow("already has an active lease");
-
-      failMarkerRelease();
-      await expect(firstClose).rejects.toThrow(
-        "injected marker unlink failure",
-      );
-      const successor = await freshCredentials.stageManagedCodexCredential({
-        agentHomeDirectory: fixture.home,
-        environment: {
-          PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: '{"owner":"successor"}',
-        },
-      });
-      await expect(firstLease.close()).resolves.toBeUndefined();
-      await expect(readFile(successor.path, "utf8")).resolves.toBe(
-        '{"owner":"successor"}',
-      );
-      await successor.close();
-      expect(markerUnlinkAttempts).toBeGreaterThanOrEqual(2);
-    } finally {
-      failMarkerRelease();
-      await firstClose.catch(() => undefined);
-    }
+    expect(
+      (await readdir(fixture.home)).filter(
+        (name) =>
+          name.includes("paperclip-auth-lease") ||
+          name.includes("paperclip-auth-home-claim") ||
+          name.includes("paperclip-auth-lock"),
+      ),
+    ).toEqual([]);
   });
-
-  it("keeps ownership live while retrying lease-marker removal", async () => {
-    const fixture = await credentialFixture();
-    const actualFs = await vi.importActual<typeof import("node:fs/promises")>(
-      "node:fs/promises",
-    );
-    let markerUnlinkAttempts = 0;
-    vi.doMock("node:fs/promises", () => ({
-      ...actualFs,
-      unlink: async (path: Parameters<typeof actualFs.unlink>[0]) => {
-        if (String(path).includes(".paperclip-auth-lease-v1-")) {
-          markerUnlinkAttempts += 1;
-          if (markerUnlinkAttempts === 1) {
-            throw Object.assign(new Error("injected marker unlink failure"), {
-              code: "EACCES",
-            });
-          }
-        }
-        await actualFs.unlink(path);
-      },
-    }));
-    vi.resetModules();
-    const freshCredentials = await import("./codex-credentials.js");
-    const lease = await freshCredentials.stageManagedCodexCredential({
-      agentHomeDirectory: fixture.home,
-      environment: { PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: "{}" },
-    });
-
-    await expect(lease.close()).rejects.toThrow(
-      "injected marker unlink failure",
-    );
-    const successor = await freshCredentials.stageManagedCodexCredential({
-      agentHomeDirectory: fixture.home,
-      environment: { PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: "{}" },
-    });
-    await successor.close();
-    expect(markerUnlinkAttempts).toBeGreaterThanOrEqual(3);
-  });
-
   it("recovers a persisted cleanup intent before admitting another provider", async () => {
     const fixture = await credentialFixture();
     const destination = join(fixture.home, "auth.json");
@@ -521,22 +433,97 @@ describe("managed Codex credentials", () => {
       ".paperclip-auth-cleanup-required",
     );
     await writeFile(destination, '{"crash_stale":true}', { mode: 0o600 });
-    await writeFile(
-      cleanupIntent,
-      "paperclip-managed-codex-cleanup-v1\n",
-      { mode: 0o600 },
-    );
+    await writeFile(cleanupIntent, "paperclip-managed-codex-cleanup-v1\n", {
+      mode: 0o600,
+    });
 
     const lease = await stageManagedCodexCredential({
       agentHomeDirectory: fixture.home,
       environment: { OPENAI_API_KEY: "launch-only-key" },
     });
-    await expect(readFile(destination)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(destination)).rejects.toMatchObject({
+      code: "ENOENT",
+    });
     await expect(readFile(cleanupIntent, "utf8")).resolves.toBe(
       "paperclip-managed-codex-cleanup-v1\n",
     );
     await lease.close();
-    await expect(readFile(cleanupIntent)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(cleanupIntent)).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
+  it("scrubs a crash-left credential staging file before admission", async () => {
+    const fixture = await credentialFixture();
+    const stagingPath = join(fixture.home, ".paperclip-auth-staging-v1");
+    const cleanupIntent = join(
+      fixture.home,
+      ".paperclip-auth-cleanup-required",
+    );
+    await writeFile(stagingPath, '{"crash_secret":"must-not-survive"}', {
+      mode: 0o600,
+    });
+    await writeFile(cleanupIntent, "paperclip-managed-codex-cleanup-v1\n", {
+      mode: 0o600,
+    });
+
+    vi.resetModules();
+    const freshCredentials = await import("./codex-credentials.js");
+    const lease = await freshCredentials.stageManagedCodexCredential({
+      agentHomeDirectory: fixture.home,
+      environment: {
+        PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: '{"owner":"successor"}',
+      },
+    });
+    await expect(readFile(stagingPath)).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await expect(readFile(lease.path, "utf8")).resolves.toBe(
+      '{"owner":"successor"}',
+    );
+    await lease.close();
+  });
+
+  it.runIf(process.platform !== "win32")(
+    "unlinks a crash-left staging symlink without touching its target",
+    async () => {
+      const fixture = await credentialFixture();
+      const target = join(fixture.root, "external-secret.json");
+      const stagingPath = join(fixture.home, ".paperclip-auth-staging-v1");
+      await writeFile(target, '{"external":"unchanged"}', { mode: 0o600 });
+      await symlink(target, stagingPath);
+
+      const lease = await stageManagedCodexCredential({
+        agentHomeDirectory: fixture.home,
+        environment: { OPENAI_API_KEY: "launch-only-key" },
+      });
+      await expect(readFile(stagingPath)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      await expect(readFile(target, "utf8")).resolves.toBe(
+        '{"external":"unchanged"}',
+      );
+      await lease.close();
+    },
+  );
+
+  it("fails closed instead of recursively removing a staging directory", async () => {
+    const fixture = await credentialFixture();
+    const stagingPath = join(fixture.home, ".paperclip-auth-staging-v1");
+    await mkdir(stagingPath, { mode: 0o700 });
+
+    await expect(
+      stageManagedCodexCredential({
+        agentHomeDirectory: fixture.home,
+        environment: { OPENAI_API_KEY: "launch-only-key" },
+      }),
+    ).rejects.toThrow("credential destination is a directory");
+    expect((await stat(stagingPath)).isDirectory()).toBe(true);
+    await expect(
+      readFile(join(fixture.home, "auth.json")),
+    ).rejects.toMatchObject({
+      code: "ENOENT",
+    });
   });
 
   it.runIf(process.platform !== "win32")(
@@ -554,8 +541,9 @@ describe("managed Codex credentials", () => {
       await probe.close();
       const originalSync = prototype.sync;
       let syncAttempts = 0;
-      const syncSpy = vi.spyOn(prototype, "sync").mockImplementation(
-        async function (this: FileHandle): Promise<void> {
+      const syncSpy = vi
+        .spyOn(prototype, "sync")
+        .mockImplementation(async function (this: FileHandle): Promise<void> {
           if ((await this.stat()).isDirectory()) {
             syncAttempts += 1;
             if (syncAttempts === 1) {
@@ -563,11 +551,12 @@ describe("managed Codex credentials", () => {
             }
           }
           await originalSync.call(this);
-        },
-      );
+        });
       try {
         await expect(lease.close()).resolves.toBeUndefined();
-        await expect(readFile(lease.path)).rejects.toMatchObject({ code: "ENOENT" });
+        await expect(readFile(lease.path)).rejects.toMatchObject({
+          code: "ENOENT",
+        });
         expect(syncAttempts).toBe(3);
       } finally {
         syncSpy.mockRestore();
@@ -586,8 +575,9 @@ describe("managed Codex credentials", () => {
       await probe.close();
       const originalSync = prototype.sync;
       let directorySyncAttempts = 0;
-      const syncSpy = vi.spyOn(prototype, "sync").mockImplementation(
-        async function (this: FileHandle): Promise<void> {
+      const syncSpy = vi
+        .spyOn(prototype, "sync")
+        .mockImplementation(async function (this: FileHandle): Promise<void> {
           if ((await this.stat()).isDirectory()) {
             directorySyncAttempts += 1;
           }
@@ -597,8 +587,7 @@ describe("managed Codex credentials", () => {
             throw new Error("injected directory sync failure");
           }
           await originalSync.call(this);
-        },
-      );
+        });
       try {
         const lease = await stageManagedCodexCredential({
           agentHomeDirectory: fixture.home,
@@ -606,7 +595,9 @@ describe("managed Codex credentials", () => {
         });
         await expect(readFile(lease.path, "utf8")).resolves.toBe("{}");
         await expect(lease.close()).resolves.toBeUndefined();
-        await expect(readFile(lease.path)).rejects.toMatchObject({ code: "ENOENT" });
+        await expect(readFile(lease.path)).rejects.toMatchObject({
+          code: "ENOENT",
+        });
         expect(directorySyncAttempts).toBe(8);
       } finally {
         syncSpy.mockRestore();
@@ -647,9 +638,7 @@ describe("managed Codex credentials", () => {
         PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: '{"fresh":true}',
       },
     });
-    await expect(readFile(destination, "utf8")).resolves.toBe(
-      '{"fresh":true}',
-    );
+    await expect(readFile(destination, "utf8")).resolves.toBe('{"fresh":true}');
     await lease.close();
   });
 
@@ -686,8 +675,9 @@ describe("managed Codex credentials", () => {
       await probe.close();
       const originalSync = prototype.sync;
       let syncAttempts = 0;
-      const syncSpy = vi.spyOn(prototype, "sync").mockImplementation(
-        async function (this: FileHandle): Promise<void> {
+      const syncSpy = vi
+        .spyOn(prototype, "sync")
+        .mockImplementation(async function (this: FileHandle): Promise<void> {
           if ((await this.stat()).isDirectory()) {
             syncAttempts += 1;
             if (syncAttempts === 1) {
@@ -695,14 +685,15 @@ describe("managed Codex credentials", () => {
             }
           }
           await originalSync.call(this);
-        },
-      );
+        });
       try {
         const lease = await stageManagedCodexCredential({
           agentHomeDirectory: fixture.home,
           environment: { OPENAI_API_KEY: "launch-only-key" },
         });
-        await expect(readFile(destination)).rejects.toMatchObject({ code: "ENOENT" });
+        await expect(readFile(destination)).rejects.toMatchObject({
+          code: "ENOENT",
+        });
         await expect(lease.close()).resolves.toBeUndefined();
         expect(syncAttempts).toBe(5);
       } finally {
@@ -721,14 +712,14 @@ describe("managed Codex credentials", () => {
       };
       await probe.close();
       const originalSync = prototype.sync;
-      const syncSpy = vi.spyOn(prototype, "sync").mockImplementation(
-        async function (this: FileHandle): Promise<void> {
+      const syncSpy = vi
+        .spyOn(prototype, "sync")
+        .mockImplementation(async function (this: FileHandle): Promise<void> {
           if ((await this.stat()).isDirectory()) {
             throw new Error("persistent directory sync failure");
           }
           await originalSync.call(this);
-        },
-      );
+        });
       try {
         const staging = stageManagedCodexCredential({
           agentHomeDirectory: fixture.home,
@@ -751,36 +742,108 @@ describe("managed Codex credentials", () => {
   );
 
   it.runIf(process.platform !== "win32")(
-    "blocks retries until a timed-out directory open and its late close settle",
+    "shares the four-slot parent filesystem budget across fresh modules",
+    async () => {
+      const fixtures = await Promise.all(
+        Array.from({ length: 5 }, () => credentialFixture()),
+      );
+      const retainedHomes = new Set(
+        fixtures.slice(0, 4).map((fixture) => fixture.home),
+      );
+      const actualFs =
+        await vi.importActual<typeof import("node:fs/promises")>(
+          "node:fs/promises",
+        );
+      let directoryOpenAttempts = 0;
+      let fifthHomeOpenAttempts = 0;
+      let observeFourOpens!: () => void;
+      const fourOpens = new Promise<void>((resolveOpens) => {
+        observeFourOpens = resolveOpens;
+      });
+      vi.doMock("node:fs/promises", () => ({
+        ...actualFs,
+        open: async (
+          path: Parameters<typeof open>[0],
+          flags: Parameters<typeof open>[1],
+          mode?: Parameters<typeof open>[2],
+        ): Promise<FileHandle> => {
+          const pathname = String(path);
+          if (retainedHomes.has(pathname)) {
+            directoryOpenAttempts += 1;
+            if (directoryOpenAttempts === 4) observeFourOpens();
+            return await new Promise<FileHandle>(() => undefined);
+          }
+          if (pathname === fixtures[4].home) fifthHomeOpenAttempts += 1;
+          return await actualFs.open(path, flags, mode);
+        },
+      }));
+      const spawnMock = vi.fn(() => {
+        const child = Object.assign(new EventEmitter(), {
+          kill: vi.fn(() => true),
+          pid: 12345,
+          unref: vi.fn(),
+        }) as unknown as ChildProcess;
+        queueMicrotask(() => child.emit("exit", 0, null));
+        return child;
+      });
+      vi.doMock("node:child_process", () => ({ spawn: spawnMock }));
+      vi.resetModules();
+      const firstCredentials = await import("./codex-credentials.js");
+      vi.useFakeTimers();
+
+      const firstStaging = Promise.all(
+        fixtures.slice(0, 4).map((fixture) =>
+          firstCredentials.stageManagedCodexCredential({
+            agentHomeDirectory: fixture.home,
+            environment: { OPENAI_API_KEY: "launch-only-key" },
+          }),
+        ),
+      );
+      let leases: Awaited<ReturnType<typeof stageManagedCodexCredential>>[] =
+        [];
+      try {
+        await fourOpens;
+        await vi.advanceTimersByTimeAsync(1_001);
+        leases = await firstStaging;
+        const registry = (
+          globalThis as typeof globalThis & {
+            __paperclipDirectorySyncHelperRegistryV1?: {
+              activeParentOperations: Set<symbol>;
+            };
+          }
+        ).__paperclipDirectorySyncHelperRegistryV1;
+        expect(registry?.activeParentOperations.size).toBe(4);
+
+        vi.resetModules();
+        const freshCredentials = await import("./codex-credentials.js");
+        const fifthLease = await freshCredentials.stageManagedCodexCredential({
+          agentHomeDirectory: fixtures[4].home,
+          environment: { OPENAI_API_KEY: "launch-only-key" },
+        });
+        leases.push(fifthLease);
+        expect(directoryOpenAttempts).toBe(4);
+        expect(fifthHomeOpenAttempts).toBe(0);
+        expect(spawnMock).toHaveBeenCalled();
+      } finally {
+        await Promise.allSettled(leases.map((lease) => lease.close()));
+      }
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "isolates retries after a directory open never settles",
     async () => {
       const fixture = await credentialFixture();
-      const actualFs = await vi.importActual<typeof import("node:fs/promises")>(
-        "node:fs/promises",
-      );
+      const actualFs =
+        await vi.importActual<typeof import("node:fs/promises")>(
+          "node:fs/promises",
+        );
       let directoryOpenAttempts = 0;
       let observeFirstOpen!: () => void;
-      let settleFirstOpen!: (handle: FileHandle) => void;
-      let observeFirstClose!: () => void;
-      let settleFirstClose!: () => void;
       const firstOpen = new Promise<void>((resolveOpen) => {
         observeFirstOpen = resolveOpen;
       });
-      const retainedOpen = new Promise<FileHandle>((resolveOpen) => {
-        settleFirstOpen = resolveOpen;
-      });
-      const firstClose = new Promise<void>((resolveClose) => {
-        observeFirstClose = resolveClose;
-      });
-      const retainedClose = new Promise<void>((resolveClose) => {
-        settleFirstClose = resolveClose;
-      });
-      const lateHandle = {
-        close: async (): Promise<void> => {
-          observeFirstClose();
-          await retainedClose;
-        },
-        sync: async (): Promise<void> => undefined,
-      } as FileHandle;
+      const retainedOpen = new Promise<FileHandle>(() => undefined);
       vi.doMock("node:fs/promises", () => ({
         ...actualFs,
         open: async (
@@ -806,50 +869,28 @@ describe("managed Codex credentials", () => {
         agentHomeDirectory: fixture.home,
         environment: { OPENAI_API_KEY: "launch-only-key" },
       });
-      const rejection = expect(staging).rejects.toThrow(
-        "remained non-durable after 1 attempt",
-      );
       await firstOpen;
-      await vi.advanceTimersByTimeAsync(20_000);
-      await rejection;
+      await vi.advanceTimersByTimeAsync(1_001);
+      const lease = await staging;
       expect(directoryOpenAttempts).toBe(1);
-
-      await expect(
-        freshCredentials.stageManagedCodexCredential({
-          agentHomeDirectory: fixture.home,
-          environment: { OPENAI_API_KEY: "launch-only-key" },
-        }),
-      ).rejects.toThrow("remained non-durable after 1 attempt");
-      expect(directoryOpenAttempts).toBe(1);
-
-      settleFirstOpen(lateHandle);
-      await firstClose;
-      await expect(
-        freshCredentials.stageManagedCodexCredential({
-          agentHomeDirectory: fixture.home,
-          environment: { OPENAI_API_KEY: "launch-only-key" },
-        }),
-      ).rejects.toThrow("remained non-durable after 1 attempt");
-      expect(directoryOpenAttempts).toBe(1);
-
-      settleFirstClose();
-      await vi.advanceTimersByTimeAsync(20_000);
-      const lease = await freshCredentials.stageManagedCodexCredential({
+      await lease.close();
+      const successor = await freshCredentials.stageManagedCodexCredential({
         agentHomeDirectory: fixture.home,
         environment: { OPENAI_API_KEY: "launch-only-key" },
       });
-      await expect(lease.close()).resolves.toBeUndefined();
-      expect(directoryOpenAttempts).toBeGreaterThan(1);
+      await successor.close();
+      expect(directoryOpenAttempts).toBe(1);
     },
   );
 
   it.runIf(process.platform !== "win32")(
-    "bounds a directory fsync without accumulating pending handles",
+    "isolates retries after a directory fsync never settles",
     async () => {
       const fixture = await credentialFixture();
-      const actualFs = await vi.importActual<typeof import("node:fs/promises")>(
-        "node:fs/promises",
-      );
+      const actualFs =
+        await vi.importActual<typeof import("node:fs/promises")>(
+          "node:fs/promises",
+        );
       let directorySyncAttempts = 0;
       let observeFirstSync!: () => void;
       const firstSync = new Promise<void>((resolveSync) => {
@@ -882,38 +923,33 @@ describe("managed Codex credentials", () => {
         agentHomeDirectory: fixture.home,
         environment: { OPENAI_API_KEY: "launch-only-key" },
       });
-      const rejection = expect(staging).rejects.toThrow(
-        "remained non-durable after 1 attempt",
-      );
       await firstSync;
-      await vi.advanceTimersByTimeAsync(20_000);
-      await rejection;
-      await expect(
-        freshCredentials.stageManagedCodexCredential({
-          agentHomeDirectory: fixture.home,
-          environment: { OPENAI_API_KEY: "launch-only-key" },
-        }),
-      ).rejects.toThrow("remained non-durable after 1 attempt");
+      await vi.advanceTimersByTimeAsync(1_001);
+      const lease = await staging;
+      await lease.close();
+      const successor = await freshCredentials.stageManagedCodexCredential({
+        agentHomeDirectory: fixture.home,
+        environment: { OPENAI_API_KEY: "launch-only-key" },
+      });
+      await successor.close();
       expect(directorySyncAttempts).toBe(1);
     },
   );
 
   it.runIf(process.platform !== "win32")(
-    "bounds a directory close that never settles after a durable fsync",
+    "isolates later syncs after a directory close never settles",
     async () => {
       const fixture = await credentialFixture();
-      const actualFs = await vi.importActual<typeof import("node:fs/promises")>(
-        "node:fs/promises",
-      );
+      const actualFs =
+        await vi.importActual<typeof import("node:fs/promises")>(
+          "node:fs/promises",
+        );
       let directoryCloseAttempts = 0;
       let observeFirstClose!: () => void;
-      let settleFirstClose!: () => void;
       const firstClose = new Promise<void>((resolveClose) => {
         observeFirstClose = resolveClose;
       });
-      const retainedClose = new Promise<void>((resolveClose) => {
-        settleFirstClose = resolveClose;
-      });
+      const retainedClose = new Promise<void>(() => undefined);
       vi.doMock("node:fs/promises", () => ({
         ...actualFs,
         open: async (
@@ -944,22 +980,286 @@ describe("managed Codex credentials", () => {
         agentHomeDirectory: fixture.home,
         environment: { OPENAI_API_KEY: "launch-only-key" },
       });
-      const rejection = expect(staging).rejects.toThrow(
-        "remained non-durable after 1 attempt",
-      );
       await firstClose;
-      await vi.advanceTimersByTimeAsync(20_000);
-      await rejection;
+      await vi.advanceTimersByTimeAsync(1_001);
+      const lease = await staging;
       expect(directoryCloseAttempts).toBe(1);
-
-      settleFirstClose();
-      await vi.advanceTimersByTimeAsync(20_000);
-      const lease = await freshCredentials.stageManagedCodexCredential({
+      await lease.close();
+      const successor = await freshCredentials.stageManagedCodexCredential({
         agentHomeDirectory: fixture.home,
         environment: { OPENAI_API_KEY: "launch-only-key" },
       });
-      await expect(lease.close()).resolves.toBeUndefined();
-      expect(directoryCloseAttempts).toBeGreaterThan(1);
+      await successor.close();
+      expect(directoryCloseAttempts).toBe(1);
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "permanently fails closed when a killed sync helper never exits",
+    async () => {
+      const fixture = await credentialFixture();
+      const actualFs =
+        await vi.importActual<typeof import("node:fs/promises")>(
+          "node:fs/promises",
+        );
+      let observeDirectoryOpen!: () => void;
+      const directoryOpen = new Promise<void>((resolveOpen) => {
+        observeDirectoryOpen = resolveOpen;
+      });
+      let directoryOpenAttempts = 0;
+      vi.doMock("node:fs/promises", () => ({
+        ...actualFs,
+        open: async (
+          path: Parameters<typeof open>[0],
+          flags: Parameters<typeof open>[1],
+          mode?: Parameters<typeof open>[2],
+        ): Promise<FileHandle> => {
+          if (String(path) === fixture.home) {
+            directoryOpenAttempts += 1;
+            observeDirectoryOpen();
+            return await new Promise<FileHandle>(() => undefined);
+          }
+          return await actualFs.open(path, flags, mode);
+        },
+      }));
+      let spawnAttempts = 0;
+      const stuckChild = Object.assign(new EventEmitter(), {
+        kill: vi.fn(() => true),
+        pid: 12345,
+        unref: vi.fn(),
+      }) as unknown as ChildProcess;
+      vi.doMock("node:child_process", () => ({
+        spawn: vi.fn(() => {
+          spawnAttempts += 1;
+          return stuckChild;
+        }),
+      }));
+      vi.resetModules();
+      const freshCredentials = await import("./codex-credentials.js");
+      vi.useFakeTimers();
+
+      const staging = freshCredentials.stageManagedCodexCredential({
+        agentHomeDirectory: fixture.home,
+        environment: { OPENAI_API_KEY: "launch-only-key" },
+      });
+      const rejection = expect(staging).rejects.toThrow(
+        /remained non-durable after 1 attempt/,
+      );
+      await directoryOpen;
+      await vi.advanceTimersByTimeAsync(1_001);
+      await vi.advanceTimersByTimeAsync(1_001);
+      await vi.advanceTimersByTimeAsync(1_001);
+      await rejection;
+      expect(spawnAttempts).toBe(1);
+      expect(directoryOpenAttempts).toBe(1);
+      expect(stuckChild.unref).toHaveBeenCalledOnce();
+
+      await expect(
+        freshCredentials.stageManagedCodexCredential({
+          agentHomeDirectory: fixture.home,
+          environment: { OPENAI_API_KEY: "launch-only-key" },
+        }),
+      ).rejects.toThrow(/remained non-durable after 1 attempt/);
+      expect(spawnAttempts).toBe(1);
+      expect(directoryOpenAttempts).toBe(1);
+      stuckChild.emit("exit", null, "SIGKILL");
+    },
+  );
+
+  it.runIf(process.platform !== "win32").each([
+    ["returns false", (): boolean => false],
+    [
+      "throws",
+      (): boolean => {
+        throw new Error("injected kill failure");
+      },
+    ],
+  ])(
+    "permanently fences a home when helper kill %s",
+    async (_label, killImplementation) => {
+      const fixture = await credentialFixture();
+      const actualFs =
+        await vi.importActual<typeof import("node:fs/promises")>(
+          "node:fs/promises",
+        );
+      let observeDirectoryOpen!: () => void;
+      const directoryOpen = new Promise<void>((resolveOpen) => {
+        observeDirectoryOpen = resolveOpen;
+      });
+      vi.doMock("node:fs/promises", () => ({
+        ...actualFs,
+        open: async (
+          path: Parameters<typeof open>[0],
+          flags: Parameters<typeof open>[1],
+          mode?: Parameters<typeof open>[2],
+        ): Promise<FileHandle> => {
+          if (String(path) === fixture.home) {
+            observeDirectoryOpen();
+            return await new Promise<FileHandle>(() => undefined);
+          }
+          return await actualFs.open(path, flags, mode);
+        },
+      }));
+      const child = Object.assign(new EventEmitter(), {
+        kill: vi.fn(killImplementation),
+        pid: 12345,
+        unref: vi.fn(),
+      }) as unknown as ChildProcess;
+      const spawnMock = vi.fn(() => child);
+      vi.doMock("node:child_process", () => ({ spawn: spawnMock }));
+      vi.resetModules();
+      const freshCredentials = await import("./codex-credentials.js");
+      vi.useFakeTimers();
+
+      const staging = freshCredentials.stageManagedCodexCredential({
+        agentHomeDirectory: fixture.home,
+        environment: { OPENAI_API_KEY: "launch-only-key" },
+      });
+      const rejection = expect(staging).rejects.toThrow(
+        /remained non-durable after 1 attempt/,
+      );
+      await directoryOpen;
+      await vi.advanceTimersByTimeAsync(1_001);
+      await vi.advanceTimersByTimeAsync(1_001);
+      await rejection;
+      await expect(
+        freshCredentials.stageManagedCodexCredential({
+          agentHomeDirectory: fixture.home,
+          environment: { OPENAI_API_KEY: "launch-only-key" },
+        }),
+      ).rejects.toThrow(/remained non-durable after 1 attempt/);
+      expect(spawnMock).toHaveBeenCalledOnce();
+      expect(child.unref).toHaveBeenCalledOnce();
+      child.emit("exit", null, "SIGKILL");
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "permanently fences a home after an asynchronous helper error",
+    async () => {
+      const fixture = await credentialFixture();
+      const actualFs =
+        await vi.importActual<typeof import("node:fs/promises")>(
+          "node:fs/promises",
+        );
+      let observeDirectoryOpen!: () => void;
+      const directoryOpen = new Promise<void>((resolveOpen) => {
+        observeDirectoryOpen = resolveOpen;
+      });
+      vi.doMock("node:fs/promises", () => ({
+        ...actualFs,
+        open: async (
+          path: Parameters<typeof open>[0],
+          flags: Parameters<typeof open>[1],
+          mode?: Parameters<typeof open>[2],
+        ): Promise<FileHandle> => {
+          if (String(path) === fixture.home) {
+            observeDirectoryOpen();
+            return await new Promise<FileHandle>(() => undefined);
+          }
+          return await actualFs.open(path, flags, mode);
+        },
+      }));
+      const child = Object.assign(new EventEmitter(), {
+        kill: vi.fn(() => true),
+        pid: 12345,
+        unref: vi.fn(),
+      }) as unknown as ChildProcess;
+      const spawnMock = vi.fn(() => {
+        queueMicrotask(() => child.emit("error", new Error("spawn failed")));
+        return child;
+      });
+      vi.doMock("node:child_process", () => ({ spawn: spawnMock }));
+      vi.resetModules();
+      const freshCredentials = await import("./codex-credentials.js");
+      vi.useFakeTimers();
+
+      const staging = freshCredentials.stageManagedCodexCredential({
+        agentHomeDirectory: fixture.home,
+        environment: { OPENAI_API_KEY: "launch-only-key" },
+      });
+      const rejection = expect(staging).rejects.toThrow(
+        /remained non-durable after 1 attempt/,
+      );
+      await directoryOpen;
+      await vi.advanceTimersByTimeAsync(1_001);
+      await rejection;
+      await expect(
+        freshCredentials.stageManagedCodexCredential({
+          agentHomeDirectory: fixture.home,
+          environment: { OPENAI_API_KEY: "launch-only-key" },
+        }),
+      ).rejects.toThrow(/remained non-durable after 1 attempt/);
+      expect(spawnMock).toHaveBeenCalledOnce();
+      child.emit("exit", null, null);
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "shares the helper process cap across fresh module instances",
+    async () => {
+      const fixture = await credentialFixture();
+      const registry = (
+        globalThis as typeof globalThis & {
+          __paperclipDirectorySyncHelperRegistryV1?: {
+            activeChildren: Set<ChildProcess>;
+          };
+        }
+      ).__paperclipDirectorySyncHelperRegistryV1;
+      expect(registry).toBeDefined();
+      const reservations = Array.from(
+        { length: 4 },
+        () => new EventEmitter() as unknown as ChildProcess,
+      );
+      for (const reservation of reservations) {
+        registry!.activeChildren.add(reservation);
+      }
+      const actualFs =
+        await vi.importActual<typeof import("node:fs/promises")>(
+          "node:fs/promises",
+        );
+      let observeDirectoryOpen!: () => void;
+      const directoryOpen = new Promise<void>((resolveOpen) => {
+        observeDirectoryOpen = resolveOpen;
+      });
+      vi.doMock("node:fs/promises", () => ({
+        ...actualFs,
+        open: async (
+          path: Parameters<typeof open>[0],
+          flags: Parameters<typeof open>[1],
+          mode?: Parameters<typeof open>[2],
+        ): Promise<FileHandle> => {
+          if (String(path) === fixture.home) {
+            observeDirectoryOpen();
+            return await new Promise<FileHandle>(() => undefined);
+          }
+          return await actualFs.open(path, flags, mode);
+        },
+      }));
+      const spawnMock = vi.fn(() => {
+        throw new Error("helper cap was bypassed");
+      });
+      vi.doMock("node:child_process", () => ({ spawn: spawnMock }));
+      vi.resetModules();
+      const freshCredentials = await import("./codex-credentials.js");
+      vi.useFakeTimers();
+      try {
+        const staging = freshCredentials.stageManagedCodexCredential({
+          agentHomeDirectory: fixture.home,
+          environment: { OPENAI_API_KEY: "launch-only-key" },
+        });
+        const rejection = expect(staging).rejects.toThrow(
+          /remained non-durable after 8 attempts/,
+        );
+        await directoryOpen;
+        await vi.advanceTimersByTimeAsync(3_000);
+        await rejection;
+        expect(spawnMock).not.toHaveBeenCalled();
+      } finally {
+        for (const reservation of reservations) {
+          registry!.activeChildren.delete(reservation);
+        }
+      }
     },
   );
 
@@ -979,8 +1279,9 @@ describe("managed Codex credentials", () => {
       await probe.close();
       const originalSync = prototype.sync;
       let directorySyncAttempts = 0;
-      const syncSpy = vi.spyOn(prototype, "sync").mockImplementation(
-        async function (this: FileHandle): Promise<void> {
+      const syncSpy = vi
+        .spyOn(prototype, "sync")
+        .mockImplementation(async function (this: FileHandle): Promise<void> {
           if ((await this.stat()).isDirectory()) {
             directorySyncAttempts += 1;
             if (directorySyncAttempts > 1) {
@@ -988,14 +1289,17 @@ describe("managed Codex credentials", () => {
             }
           }
           await originalSync.call(this);
-        },
-      );
+        });
       try {
-        await expect(stageManagedCodexCredential({
-          agentHomeDirectory: fixture.home,
-          environment: { PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: "{}" },
-        })).rejects.toThrow("remained non-durable after 8 attempts");
-        await expect(readFile(destination)).rejects.toMatchObject({ code: "ENOENT" });
+        await expect(
+          stageManagedCodexCredential({
+            agentHomeDirectory: fixture.home,
+            environment: { PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: "{}" },
+          }),
+        ).rejects.toThrow("remained non-durable after 8 attempts");
+        await expect(readFile(destination)).rejects.toMatchObject({
+          code: "ENOENT",
+        });
 
         // Model a crash losing the unsynced intent directory entry and the
         // next process finding an unexpected auth file. A fresh module has no
@@ -1006,20 +1310,24 @@ describe("managed Codex credentials", () => {
         await writeFile(destination, '{"orphaned":true}', { mode: 0o600 });
         vi.resetModules();
         const freshCredentials = await import("./codex-credentials.js");
-        const persistentSyncFailure = vi.spyOn(prototype, "sync").mockImplementation(
-          async function (this: FileHandle): Promise<void> {
+        const persistentSyncFailure = vi
+          .spyOn(prototype, "sync")
+          .mockImplementation(async function (this: FileHandle): Promise<void> {
             if ((await this.stat()).isDirectory()) {
               throw new Error("persistent recovery sync failure");
             }
             await originalSync.call(this);
-          },
-        );
+          });
         try {
-          await expect(freshCredentials.stageManagedCodexCredential({
-            agentHomeDirectory: fixture.home,
-            environment: { OPENAI_API_KEY: "launch-only-key" },
-          })).rejects.toThrow("remained non-durable after 8 attempts");
-          await expect(readFile(destination)).rejects.toMatchObject({ code: "ENOENT" });
+          await expect(
+            freshCredentials.stageManagedCodexCredential({
+              agentHomeDirectory: fixture.home,
+              environment: { OPENAI_API_KEY: "launch-only-key" },
+            }),
+          ).rejects.toThrow("remained non-durable after 8 attempts");
+          await expect(readFile(destination)).rejects.toMatchObject({
+            code: "ENOENT",
+          });
         } finally {
           persistentSyncFailure.mockRestore();
         }
@@ -1041,8 +1349,9 @@ describe("managed Codex credentials", () => {
       await probe.close();
       const originalSync = prototype.sync;
       let directorySyncAttempts = 0;
-      const syncSpy = vi.spyOn(prototype, "sync").mockImplementation(
-        async function (this: FileHandle): Promise<void> {
+      const syncSpy = vi
+        .spyOn(prototype, "sync")
+        .mockImplementation(async function (this: FileHandle): Promise<void> {
           if ((await this.stat()).isDirectory()) {
             directorySyncAttempts += 1;
             if (directorySyncAttempts > 2) {
@@ -1050,13 +1359,14 @@ describe("managed Codex credentials", () => {
             }
           }
           await originalSync.call(this);
-        },
-      );
+        });
       try {
-        await expect(stageManagedCodexCredential({
-          agentHomeDirectory: fixture.home,
-          environment: { PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: "{}" },
-        })).rejects.toThrow("remained non-durable after 8 attempts");
+        await expect(
+          stageManagedCodexCredential({
+            agentHomeDirectory: fixture.home,
+            environment: { PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: "{}" },
+          }),
+        ).rejects.toThrow("remained non-durable after 8 attempts");
         await expect(readFile(destination, "utf8")).resolves.toBe("{}");
 
         syncSpy.mockRestore();
@@ -1168,18 +1478,61 @@ async function credentialFixture(): Promise<{ root: string; home: string }> {
   return { root, home };
 }
 
-function credentialLeasePrimaryPort(home: string): number {
-  return credentialLeasePort(home, 0);
+function credentialLeasePorts(home: string): readonly number[] {
+  const userScope =
+    typeof process.getuid === "function" ? String(process.getuid()) : "win32";
+  return credentialLeasePortsForScope(userScope, home);
 }
 
-function credentialLeasePort(home: string, index: number): number {
-  const scope = `${
-    typeof process.getuid === "function" ? process.getuid() : "win32"
-  }\0${home}`;
-  const digest = createHash("sha256").update(scope).digest();
+function credentialLeasePortsForScope(
+  userScope: string,
+  home: string,
+): readonly number[] {
+  const digest = createHash("sha256")
+    .update("paperclip-managed-codex-lease-v2:")
+    .update(userScope)
+    .update("\0")
+    .update(home)
+    .digest();
   const start = digest.readUInt16BE(0) % 16_384;
-  const stride = digest.readUInt16BE(2) | 1;
-  return 49_152 + ((start + index * stride) % 16_384);
+  const step = (digest.readUInt16BE(2) | 1) % 16_384;
+  return Array.from(
+    { length: 3 },
+    (_, index) => 49_152 + ((start + index * step) % 16_384),
+  );
+}
+
+async function listenSilently(
+  port: number,
+): Promise<{ close(): Promise<void> }> {
+  const sockets = new Set<Socket>();
+  const server: Server = createServer((socket) => {
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
+    socket.pause();
+  });
+  await new Promise<void>((resolveListen, rejectListen) => {
+    server.once("error", rejectListen);
+    server.listen(
+      {
+        exclusive: true,
+        host: "127.0.0.1",
+        port,
+      },
+      resolveListen,
+    );
+  });
+  return {
+    async close(): Promise<void> {
+      for (const socket of sockets) socket.destroy();
+      await new Promise<void>((resolveClose, rejectClose) => {
+        server.close((error) => {
+          if (error) rejectClose(error);
+          else resolveClose();
+        });
+      });
+    },
+  };
 }
 
 async function waitForChildMessage(
