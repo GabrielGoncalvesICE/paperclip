@@ -1436,7 +1436,7 @@ describe("ACPX installation integrity", () => {
   );
 
   it.runIf(process.platform === "linux")(
-    "routes emergency child kill through the live guardian owner pipe",
+    "keeps emergency guardian termination effective across a stopped retry",
     async () => {
       const fixture = await persistentInstallationFixture();
       const pidFile = join(fixture.root, "emergency-provider.pid");
@@ -1464,10 +1464,23 @@ describe("ACPX installation integrity", () => {
       );
       await awaitVerifiedAcpxProviderOwnership(guardian);
       const providerPid = Number.parseInt(await waitForFile(pidFile), 10);
-      expect(guardian.kill("SIGKILL")).toBe(true);
-      await once(guardian, "exit");
-      await waitUntil(() => !processAlive(providerPid));
-      await Promise.all(fences.map(closeServer));
+      const guardianExit = once(guardian, "exit");
+      process.kill(guardian.pid!, "SIGSTOP");
+      try {
+        expect(guardian.kill("SIGKILL")).toBe(true);
+        // Retry synchronously while the resumed guardian has not yet processed
+        // owner-pipe EOF. The exact ChildProcess remains the signal authority.
+        expect(guardian.kill("SIGKILL")).toBe(true);
+        await guardianExit;
+        await waitUntil(() => !processAlive(providerPid));
+      } finally {
+        if (guardian.exitCode === null && guardian.signalCode === null) {
+          process.kill(guardian.pid!, "SIGCONT");
+          guardian.kill("SIGKILL");
+          await guardianExit.catch(() => undefined);
+        }
+        await Promise.all(fences.map(closeServer));
+      }
     },
   );
 });

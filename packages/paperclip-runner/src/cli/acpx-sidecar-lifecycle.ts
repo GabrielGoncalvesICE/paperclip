@@ -104,15 +104,24 @@ export async function combineSidecarAdmissionCleanups(
 }
 
 /**
- * Keep cleanup ownership until one sequential close proves the host released.
- * A caller retry may succeed while an older recovery is still pending; that
- * success supersedes the stale owner without turning a retry failure into an
- * ownership release.
+ * Keep ownership of every cleanup that was started for the same host. Every
+ * concurrent attempt must settle successfully: an outstanding or rejected
+ * retry can still own provider work and must not disappear from the sidecar's
+ * shutdown/admission accounting.
  */
-export async function firstSuccessfulSidecarHostCleanup(
+export async function combineSidecarHostCleanups(
   cleanups: readonly [Promise<void>, Promise<void>],
 ): Promise<void> {
-  await Promise.any(cleanups);
+  const outcomes = await Promise.allSettled(cleanups);
+  const errors = outcomes.flatMap((outcome) =>
+    outcome.status === "rejected" ? [outcome.reason as unknown] : [],
+  );
+  if (errors.length > 0) {
+    throw new AggregateError(
+      errors,
+      "ACPX active-host cleanup did not release provider ownership",
+    );
+  }
 }
 
 export async function closeActiveSidecarHostWithin(

@@ -1767,6 +1767,63 @@ describe("Codex ACPX runtime adapter", () => {
     expect(child.kill).not.toHaveBeenCalled();
   });
 
+  it("propagates ownership failure from a provider spawned during verification", async () => {
+    const firstChild = fakeChild();
+    const racingChild = fakeChild();
+    const command = fakeCommand();
+    vi.mocked(command.spawn)
+      .mockReturnValueOnce(firstChild)
+      .mockReturnValueOnce(racingChild);
+    let resolveFirstOwnership!: () => void;
+    const firstOwnership = new Promise<void>((resolve) => {
+      resolveFirstOwnership = resolve;
+    });
+    const racingOwnershipFailure = new Error(
+      "racing guardian ownership failed",
+    );
+    const runtime = fakeRuntime();
+    let runtimeOptions: AcpRuntimeOptions | undefined;
+    const awaitProviderOwnership = vi.fn((child: ChildProcess) => {
+      if (child !== firstChild) return Promise.reject(racingOwnershipFailure);
+      return firstOwnership.then(() => {
+        // This callback runs while verification still awaits its initial
+        // ownership batch, reproducing the exact append-after-splice race.
+        runtimeOptions?.spawnAgent?.({
+          command: "ignored",
+          args: ["--stdio"],
+          options: {},
+        });
+      });
+    });
+    vi.mocked(runtime.ensureSession).mockImplementation(async () => {
+      runtimeOptions?.spawnAgent?.({
+        command: "ignored",
+        args: ["--stdio"],
+        options: {},
+      });
+      return HANDLE;
+    });
+
+    const opening = openCodexAcpxRuntime(openOptions(command), {
+      createRegistry: () => registry(),
+      createStore: () => store(),
+      awaitProviderOwnership,
+      createRuntime: (options) => {
+        runtimeOptions = options;
+        return runtime;
+      },
+    });
+    await vi.waitFor(() =>
+      expect(awaitProviderOwnership).toHaveBeenCalledOnce(),
+    );
+    resolveFirstOwnership();
+
+    await expect(opening).rejects.toBe(racingOwnershipFailure);
+    expect(awaitProviderOwnership).toHaveBeenCalledTimes(2);
+    expect(firstChild.kill).toHaveBeenCalledWith("SIGTERM");
+    expect(racingChild.kill).toHaveBeenCalledWith("SIGTERM");
+  });
+
   it("bounds a stalled session handshake and terminates its provider", async () => {
     const child = fakeChild();
     const command = fakeCommand();

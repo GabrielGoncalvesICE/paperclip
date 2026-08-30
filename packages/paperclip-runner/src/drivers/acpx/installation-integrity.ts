@@ -830,19 +830,34 @@ function protectProviderGroupKill(
 ): void {
   const signalGuardian = child.kill.bind(child);
   let groupReaped = false;
+  let revocationStarted = false;
+  child.once("exit", () => {
+    groupReaped = true;
+  });
   child.kill = (signal?: NodeJS.Signals | number): boolean => {
     if (signal !== "SIGKILL" && signal !== 9) {
       return signalGuardian(signal);
     }
     if (groupReaped) return false;
-    groupReaped = true;
-    // Revocation closes the retained parent-to-guardian owner pipe. A live
-    // guardian receives EOF and atomically reaps its own still-pinned process
-    // group; a dead guardian cannot turn this close into a signal to a reused
-    // numeric PID or PGID. The provider also observes guardian-pipe EOF while
-    // its inherited credential quorum remains authoritative until self-reap.
-    guardianOwnerPipe.destroy();
-    return true;
+    if (!revocationStarted) {
+      revocationStarted = true;
+      // Revocation closes the retained parent-to-guardian owner pipe. Resume
+      // the exact direct child as well: SIGCONT is harmless for a running
+      // guardian and lets a stopped guardian observe EOF and reap its own
+      // still-pinned group. Do not mark the group reaped until exit is seen.
+      guardianOwnerPipe.destroy();
+      try {
+        signalGuardian("SIGCONT");
+      } catch {
+        // The pipe close remains the primary revocation operation. A later
+        // retry still owns the exact ChildProcess signal handle below.
+      }
+      return true;
+    }
+    // If the guardian did not process EOF, a retry can still terminate this
+    // exact direct child. Its live ChildProcess remains pinned until the exit
+    // event; no saved numeric PID or process-group identifier is reused.
+    return signalGuardian("SIGKILL");
   };
 }
 

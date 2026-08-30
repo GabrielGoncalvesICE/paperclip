@@ -9,7 +9,7 @@ import {
   closeActiveSidecarHostWithin,
   closeSidecarHostForCommand,
   combineSidecarAdmissionCleanups,
-  firstSuccessfulSidecarHostCleanup,
+  combineSidecarHostCleanups,
   hasSidecarSessionOwnership,
   observeSidecarCleanupWithin,
   parseAcpxRunAttachment,
@@ -213,21 +213,30 @@ describe("Codex ACPX runtime sidecar", () => {
     expect(close).toHaveBeenCalledTimes(4);
   });
 
-  it("lets a successful command retry supersede a pending cleanup owner", async () => {
-    const pending = new Promise<void>(() => undefined);
+  it("retains a pending cleanup owner after a command retry succeeds", async () => {
+    let finishPending!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      finishPending = resolve;
+    });
     const successfulRetry = Promise.resolve();
+    const owner = combineSidecarHostCleanups([pending, successfulRetry]);
+    let settled = false;
+    void owner.then(() => {
+      settled = true;
+    });
 
-    await expect(
-      firstSuccessfulSidecarHostCleanup([pending, successfulRetry]),
-    ).resolves.toBeUndefined();
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    finishPending();
+    await expect(owner).resolves.toBeUndefined();
   });
 
-  it("retains the prior cleanup owner when a command retry fails", async () => {
+  it("preserves a retry failure after the prior cleanup succeeds", async () => {
     let finishPrior!: () => void;
     const prior = new Promise<void>((resolve) => {
       finishPrior = resolve;
     });
-    const owner = firstSuccessfulSidecarHostCleanup([
+    const owner = combineSidecarHostCleanups([
       prior,
       Promise.reject(new Error("retry failed")),
     ]);
@@ -241,7 +250,7 @@ describe("Codex ACPX runtime sidecar", () => {
     await Promise.resolve();
     expect(settled).toBe(false);
     finishPrior();
-    await expect(owner).resolves.toBeUndefined();
+    await expect(owner).rejects.toThrow("did not release provider ownership");
   });
 
   it("bounds status verification before cleaning up the opened host", async () => {

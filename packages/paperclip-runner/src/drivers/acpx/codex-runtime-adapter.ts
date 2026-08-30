@@ -81,6 +81,8 @@ export interface CodexAcpxRuntimeDependencies {
   runtimeCloseTimeoutMs?: number;
   /** Internal test seam for the provider-session admission deadline. */
   sessionHandshakeTimeoutMs?: number;
+  /** Internal test seam for verified guardian ownership transfer. */
+  awaitProviderOwnership?: (child: ChildProcess) => Promise<void>;
   /** Retains autonomous cleanup ownership across the sidecar lifecycle. */
   retainCleanup?: (cleanup: Promise<void>) => void;
   /** Internal test seam for the fail-closed platform admission boundary. */
@@ -138,7 +140,10 @@ export async function openCodexAcpxRuntime(
     dependencies.retainCleanup?.(cleanup);
     retainCodexRuntimeCleanup(cleanup);
   };
-  const children = new SpawnedChildSet(retainCleanup);
+  const children = new SpawnedChildSet(
+    retainCleanup,
+    dependencies.awaitProviderOwnership,
+  );
   const baseStore = createStore({ stateDir: options.stateDirectory });
   let failedHandshakeHandle: AcpRuntimeHandle | null = null;
   let admissionCleanup: RuntimeAdmissionCleanup | null = null;
@@ -1002,18 +1007,22 @@ class SpawnedChildSet {
   readonly #errors = new Set<unknown>();
   readonly #terminations = new Map<ChildProcess, Promise<unknown[]>>();
   readonly #lifetimeOwnership: Promise<void>[] = [];
+  #lifetimeOwnershipSealed = false;
   #sealed = false;
 
   constructor(
     private readonly retainCleanup?: (cleanup: Promise<void>) => void,
+    private readonly awaitProviderOwnership: (
+      child: ChildProcess,
+    ) => Promise<void> = awaitVerifiedAcpxProviderOwnership,
   ) {}
 
   add(child: ChildProcess): ChildProcess {
     this.#track(child);
-    const ownership = awaitVerifiedAcpxProviderOwnership(child);
+    const ownership = this.awaitProviderOwnership(child);
     void ownership.catch(() => undefined);
     this.#lifetimeOwnership.push(ownership);
-    if (this.#sealed) {
+    if (this.#sealed || this.#lifetimeOwnershipSealed) {
       // Once the stable-empty cleanup point is sealed, ACPX no longer has
       // authority to create provider work. Retain an immediate-kill attempt
       // through exit verification before rejecting the spawn itself.
@@ -1028,14 +1037,27 @@ class SpawnedChildSet {
       });
       this.retainCleanup?.(cleanup);
       void cleanup.catch(() => undefined);
-      throw new Error("ACPX provider spawned after cleanup was sealed");
+      throw new Error(
+        this.#sealed
+          ? "ACPX provider spawned after cleanup was sealed"
+          : "ACPX provider spawned after ownership admission was sealed",
+      );
     }
     return child;
   }
 
   async verifyLifetimeOwnership(): Promise<void> {
-    const ownership = this.#lifetimeOwnership.splice(0);
-    await Promise.all(ownership);
+    for (;;) {
+      const ownership = this.#lifetimeOwnership.splice(0);
+      if (ownership.length === 0) {
+        // This check and seal are synchronous. Any spawn added while an
+        // earlier batch was pending is observed by the next loop iteration;
+        // no later provider can race admission after the stable-empty point.
+        this.#lifetimeOwnershipSealed = true;
+        return;
+      }
+      await Promise.all(ownership);
+    }
   }
 
   #track(child: ChildProcess): void {
