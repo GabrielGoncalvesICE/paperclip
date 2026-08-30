@@ -42,7 +42,8 @@ export async function readSidecarHostStatusWithin(
       host.status(),
       new Promise<never>((_resolve, reject) => {
         timer = setTimeout(
-          () => reject(new Error("ACPX session status read exceeded its timeout")),
+          () =>
+            reject(new Error("ACPX session status read exceeded its timeout")),
           timeoutMs,
         );
         timer.unref();
@@ -92,7 +93,7 @@ export async function combineSidecarAdmissionCleanups(
 ): Promise<void> {
   const outcomes = await Promise.allSettled(cleanups);
   const errors = outcomes.flatMap((outcome) =>
-    outcome.status === "rejected" ? [outcome.reason as unknown] : []
+    outcome.status === "rejected" ? [outcome.reason as unknown] : [],
   );
   if (errors.length > 0) {
     throw new AggregateError(

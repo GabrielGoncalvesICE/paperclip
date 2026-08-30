@@ -96,14 +96,20 @@ describe("Codex ACPX runtime sidecar", () => {
       finishCleanup = resolve;
     });
 
-    await expect(awaitSidecarCleanupWithin(cleanup, 1)).resolves.toBe("deferred");
+    await expect(awaitSidecarCleanupWithin(cleanup, 1)).resolves.toBe(
+      "deferred",
+    );
     let settled = false;
-    void cleanup.then(() => { settled = true; });
+    void cleanup.then(() => {
+      settled = true;
+    });
     expect(settled).toBe(false);
     finishCleanup();
     await cleanup;
     expect(settled).toBe(true);
-    await expect(awaitSidecarCleanupWithin(cleanup, 1)).resolves.toBe("settled");
+    await expect(awaitSidecarCleanupWithin(cleanup, 1)).resolves.toBe(
+      "settled",
+    );
   });
 
   it("preserves retained cleanup failure for shutdown accounting", async () => {
@@ -127,8 +133,12 @@ describe("Codex ACPX runtime sidecar", () => {
     ]);
     let settled = false;
     void retained.then(
-      () => { settled = true; },
-      () => { settled = true; },
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
     );
 
     await Promise.resolve();
@@ -144,13 +154,9 @@ describe("Codex ACPX runtime sidecar", () => {
     const close = vi.fn(() => cleanup);
     const retainCleanup = vi.fn();
 
-    await expect(closeActiveSidecarHostWithin(
-      { close },
-      "SIGTERM",
-      1,
-      retainCleanup,
-    ))
-      .resolves.toBe("deferred");
+    await expect(
+      closeActiveSidecarHostWithin({ close }, "SIGTERM", 1, retainCleanup),
+    ).resolves.toBe("deferred");
     expect(close).toHaveBeenCalledWith({ reason: "SIGTERM" });
     expect(retainCleanup).toHaveBeenCalledWith(cleanup);
   });
@@ -163,12 +169,9 @@ describe("Codex ACPX runtime sidecar", () => {
     const close = vi.fn(() => cleanup);
     const retainCleanup = vi.fn();
 
-    await expect(closeSidecarHostForCommand(
-      { close },
-      "session close",
-      1,
-      retainCleanup,
-    )).rejects.toThrow("cleanup exceeded its command timeout");
+    await expect(
+      closeSidecarHostForCommand({ close }, "session close", 1, retainCleanup),
+    ).rejects.toThrow("cleanup exceeded its command timeout");
     expect(close).toHaveBeenCalledOnce();
     expect(retainCleanup).toHaveBeenCalledWith(cleanup);
 
@@ -178,11 +181,9 @@ describe("Codex ACPX runtime sidecar", () => {
 
   it("preserves a settled command cleanup failure", async () => {
     const cleanup = Promise.reject(new Error("runtime close failed"));
-    await expect(closeSidecarHostForCommand(
-      { close: () => cleanup },
-      "session close",
-      10,
-    )).rejects.toThrow("runtime close failed");
+    await expect(
+      closeSidecarHostForCommand({ close: () => cleanup }, "session close", 10),
+    ).rejects.toThrow("runtime close failed");
   });
 
   it("recovers a rejected active-host cleanup sequentially", async () => {

@@ -1282,16 +1282,11 @@ describe("ACPX installation integrity", () => {
         await contender!.close();
       } finally {
         if (owner.exitCode === null && owner.signalCode === null) {
+          // This direct child handle owns the guardian pipe. Closing it lets
+          // the live guardian reap only its own still-pinned group; never
+          // signal a saved guardian PGID from cleanup.
           owner.kill("SIGKILL");
           await once(owner, "exit").catch(() => undefined);
-        }
-        if (guardianPid > 0) killGroupBestEffort(guardianPid);
-        if (providerPid > 0 && processAlive(providerPid)) {
-          try {
-            process.kill(providerPid, "SIGKILL");
-          } catch {
-            /* gone */
-          }
         }
       }
     },
@@ -1371,16 +1366,10 @@ describe("ACPX installation integrity", () => {
         await contender.close();
       } finally {
         if (owner.exitCode === null && owner.signalCode === null) {
+          // Cleanup is authorized only through the direct child handle and
+          // its owner pipe. Saved guardian/provider identifiers may be reused.
           owner.kill("SIGKILL");
           await once(owner, "exit").catch(() => undefined);
-        }
-        if (guardianPid > 0) killGroupBestEffort(guardianPid);
-        if (providerPid > 0 && processAlive(providerPid)) {
-          try {
-            process.kill(providerPid, "SIGKILL");
-          } catch {
-            /* gone */
-          }
         }
       }
     },
@@ -1577,14 +1566,6 @@ function processAlive(pid: number): boolean {
     return true;
   } catch {
     return false;
-  }
-}
-
-function killGroupBestEffort(processGroupId: number): void {
-  try {
-    process.kill(-processGroupId, "SIGKILL");
-  } catch {
-    // The sentinel already reaped the group.
   }
 }
 

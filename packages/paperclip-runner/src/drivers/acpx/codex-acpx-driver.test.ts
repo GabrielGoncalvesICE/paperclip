@@ -511,11 +511,10 @@ describe("Codex ACPX harness driver", () => {
 
       fixture.host.close.mockImplementation(({ reason }) =>
         reason.includes("scheduled quarantined cleanup recovery")
-          ? // Exercise the complete production host bound: two seconds for
-            // active-turn cancellation plus bounded protocol, TERM, and
-            // guardian-group KILL.
+          ? // Exercise the complete production host bound: active-turn
+            // cancellation plus bounded protocol, TERM, and guardian-group KILL.
             new Promise<void>((resolve) => setTimeout(resolve, 9_500))
-          : Promise.resolve()
+          : Promise.resolve(),
       );
       await vi.advanceTimersToNextTimerAsync();
       let admissionSettled = false;
@@ -1619,9 +1618,11 @@ describe("Codex ACPX harness driver", () => {
     const cancellation = new Error("recovery cancelled before start");
     controller.abort(cancellation);
 
-    await expect(fixture.driver.recoverSession!(snapshot, {
-      signal: controller.signal,
-    })).resolves.toEqual({
+    await expect(
+      fixture.driver.recoverSession!(snapshot, {
+        signal: controller.signal,
+      }),
+    ).resolves.toEqual({
       recovered: false,
       reason: cancellation.message,
     });
@@ -1767,7 +1768,9 @@ describe("Codex ACPX harness driver", () => {
         semanticResult: { turnId: semanticTurn.turnId },
       });
       expect(snapshot.terminalTurns?.at(-1)?.turnId).toBe(laterTurn.turnId);
-      await session.close({ reason: "simulate unsuccessful follow-up recovery" });
+      await session.close({
+        reason: "simulate unsuccessful follow-up recovery",
+      });
 
       await expect(fixture.driver.recoverSession!(snapshot)).resolves.toEqual({
         recovered: false,
@@ -1799,7 +1802,11 @@ describe("Codex ACPX harness driver", () => {
     });
     fixture.finishTurn({
       status: "failed",
-      error: { code: "provider_retry", message: "Retry the turn", retryable: true },
+      error: {
+        code: "provider_retry",
+        message: "Retry the turn",
+        retryable: true,
+      },
     });
     await firstTerminal;
 
@@ -1823,10 +1830,12 @@ describe("Codex ACPX harness driver", () => {
     });
     expect(snapshot.semanticResult?.turnId).not.toBe(first.turnId);
     expect(snapshot.terminalTurns?.at(-1)?.turnId).toBe(second.turnId);
-    expect(snapshot.terminalTurns).toEqual(expect.arrayContaining([
-      expect.objectContaining({ turnId: first.turnId }),
-      expect.objectContaining({ turnId: second.turnId }),
-    ]));
+    expect(snapshot.terminalTurns).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ turnId: first.turnId }),
+        expect.objectContaining({ turnId: second.turnId }),
+      ]),
+    );
     const successfulTerminal = snapshot.terminalTurns?.find(
       (terminal) => terminal.turnId === second.turnId,
     );
@@ -1836,15 +1845,19 @@ describe("Codex ACPX harness driver", () => {
     });
     await session.close({ reason: "simulate successful retry recovery" });
 
-    await expect(fixture.driver.recoverSession!({
-      ...snapshot,
-      activeTurnId: first.turnId,
-    })).resolves.toEqual({
+    await expect(
+      fixture.driver.recoverSession!({
+        ...snapshot,
+        activeTurnId: first.turnId,
+      }),
+    ).resolves.toEqual({
       recovered: false,
       reason:
         "persisted Codex ACPX active turn is not the completed semantic settlement",
     });
-    await expect(fixture.driver.recoverSession!(snapshot)).resolves.toMatchObject({
+    await expect(
+      fixture.driver.recoverSession!(snapshot),
+    ).resolves.toMatchObject({
       recovered: true,
     });
   });
@@ -1901,7 +1914,9 @@ describe("Codex ACPX harness driver", () => {
     });
     await session.close({ reason: "simulate reaffirmed result recovery" });
 
-    await expect(fixture.driver.recoverSession!(snapshot)).resolves.toMatchObject({
+    await expect(
+      fixture.driver.recoverSession!(snapshot),
+    ).resolves.toMatchObject({
       recovered: true,
     });
   });
@@ -1948,9 +1963,7 @@ describe("Codex ACPX harness driver", () => {
     });
     const failedEvents = await failedTerminal;
     expect(
-      failedEvents.filter(
-        (event) => event.eventType === "run.result.proposed",
-      ),
+      failedEvents.filter((event) => event.eventType === "run.result.proposed"),
     ).toHaveLength(1);
 
     const snapshot = await session.snapshot();
@@ -2209,10 +2222,12 @@ describe("Codex ACPX harness driver", () => {
     }));
 
     for (const activeTurnId of [turnId, null]) {
-      await expect(fixture.driver.recoverSession!({
-        ...snapshot,
-        activeTurnId,
-      })).resolves.toEqual({
+      await expect(
+        fixture.driver.recoverSession!({
+          ...snapshot,
+          activeTurnId,
+        }),
+      ).resolves.toEqual({
         recovered: false,
         reason:
           "persisted Codex ACPX resultless recovery requires a completed terminal turn",
@@ -2316,7 +2331,9 @@ function driverFixture(
   finishTurn(result: Awaited<AcpxRuntimeTurn["result"]>): void;
 } {
   let turnCount = 0;
-  let activeResult: ReturnType<typeof deferred<Awaited<AcpxRuntimeTurn["result"]>>> | null = null;
+  let activeResult: ReturnType<
+    typeof deferred<Awaited<AcpxRuntimeTurn["result"]>>
+  > | null = null;
   const createTurn = (): AcpxRuntimeTurn => {
     activeResult = deferred<Awaited<AcpxRuntimeTurn["result"]>>();
     return {
@@ -2355,7 +2372,10 @@ function driverFixture(
     };
   };
   const host = fakeHost(createTurn, () =>
-    activeResult?.resolve({ status: "cancelled", stopReason: "session_closed" }),
+    activeResult?.resolve({
+      status: "cancelled",
+      stopReason: "session_closed",
+    }),
   );
   let hostOptions: OpenAcpxRuntimeHostOptions | null = null;
   const openHost = vi.fn(

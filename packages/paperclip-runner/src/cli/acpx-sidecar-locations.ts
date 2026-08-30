@@ -5,7 +5,7 @@ export const ACPX_WORKSPACE_RELATIVE_DISPLAY_BOUNDARY =
 
 function record(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value)
-    ? value as Record<string, unknown>
+    ? (value as Record<string, unknown>)
     : {};
 }
 
@@ -33,15 +33,17 @@ export function safeAcpxLocations(
     if (!local || isAbsolute(local)) return [];
     const portable = sep === "\\" ? local.replaceAll("\\", "/") : local;
     if (
-      portable.startsWith("/")
-      || portable.split("/").some((segment) => segment === "..")
+      portable.startsWith("/") ||
+      portable.split("/").some((segment) => segment === "..")
     ) {
       return [];
     }
-    return [{
-      path: [...portable].slice(0, 4_000).join(""),
-      line: candidate.line ?? null,
-      pathBoundary: ACPX_WORKSPACE_RELATIVE_DISPLAY_BOUNDARY,
-    }];
+    return [
+      {
+        path: [...portable].slice(0, 4_000).join(""),
+        line: candidate.line ?? null,
+        pathBoundary: ACPX_WORKSPACE_RELATIVE_DISPLAY_BOUNDARY,
+      },
+    ];
   });
 }

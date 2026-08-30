@@ -359,14 +359,18 @@ async function dispatch(
     const activeHost = requireHost();
     return {
       identity: activeHost.identity(),
-      status: sanitizeRuntimeStatus(await readSidecarHostStatusWithin(activeHost)),
+      status: sanitizeRuntimeStatus(
+        await readSidecarHostStatusWithin(activeHost),
+      ),
     };
   }
   if (request.command === "session.snapshot") {
     const activeHost = requireHost();
     return {
       identity: activeHost.identity(),
-      status: sanitizeRuntimeStatus(await readSidecarHostStatusWithin(activeHost)),
+      status: sanitizeRuntimeStatus(
+        await readSidecarHostStatusWithin(activeHost),
+      ),
       runId,
       turnId,
       sequence,
@@ -385,11 +389,7 @@ async function dispatch(
     const identity = activeHost.identity();
     await closeSidecarHostForCommand(
       activeHost,
-      boundedOptionalText(
-        request.params.reason,
-        "Paperclip suspension",
-        4_000,
-      ),
+      boundedOptionalText(request.params.reason, "Paperclip suspension", 4_000),
       undefined,
       (cleanup) => retainActiveHostCleanup(activeHost, cleanup),
     );
@@ -410,11 +410,7 @@ async function dispatch(
       const activeHost = host;
       await closeSidecarHostForCommand(
         activeHost,
-        boundedOptionalText(
-          request.params.reason,
-          "Paperclip close",
-          4_000,
-        ),
+        boundedOptionalText(request.params.reason, "Paperclip close", 4_000),
         undefined,
         (cleanup) => retainActiveHostCleanup(activeHost, cleanup),
       );
@@ -1055,10 +1051,12 @@ async function shutdown(reason: string): Promise<void> {
     });
   }
   let cleanupIncomplete = false;
-  const outcomes = await Promise.all(cleanupOwners.map(async (owner) => ({
-    ...owner,
-    outcome: await observeSidecarCleanupWithin(owner.cleanup),
-  })));
+  const outcomes = await Promise.all(
+    cleanupOwners.map(async (owner) => ({
+      ...owner,
+      outcome: await observeSidecarCleanupWithin(owner.cleanup),
+    })),
+  );
   for (const { kind, outcome } of outcomes) {
     if (outcome.status === "deferred") {
       cleanupIncomplete = true;
