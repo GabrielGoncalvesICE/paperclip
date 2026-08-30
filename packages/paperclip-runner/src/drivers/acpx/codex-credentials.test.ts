@@ -1025,7 +1025,8 @@ describe("managed Codex credentials", () => {
       let spawnAttempts = 0;
       const stuckChild = Object.assign(new EventEmitter(), {
         kill: vi.fn(() => true),
-        pid: 12345,
+        // Signal-0 must observe a live process for this retained-helper fixture.
+        pid: process.pid,
         unref: vi.fn(),
       }) as unknown as ChildProcess;
       vi.doMock("node:child_process", () => ({
@@ -1102,7 +1103,8 @@ describe("managed Codex credentials", () => {
       }));
       const child = Object.assign(new EventEmitter(), {
         kill: vi.fn(killImplementation),
-        pid: 12345,
+        // Signal-0 must observe a live process for this retained-helper fixture.
+        pid: process.pid,
         unref: vi.fn(),
       }) as unknown as ChildProcess;
       const spawnMock = vi.fn(() => child);
@@ -1162,7 +1164,8 @@ describe("managed Codex credentials", () => {
       }));
       const child = Object.assign(new EventEmitter(), {
         kill: vi.fn(() => true),
-        pid: 12345,
+        // Signal-0 must observe a live process for this retained-helper fixture.
+        pid: process.pid,
         unref: vi.fn(),
       }) as unknown as ChildProcess;
       const spawnMock = vi.fn(() => {
