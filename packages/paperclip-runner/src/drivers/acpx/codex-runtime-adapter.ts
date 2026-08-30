@@ -252,6 +252,7 @@ export async function openCodexAcpxRuntime(
       // been cancelled. Check at the last host-owned boundary so a late
       // handshake cannot create a provider process after authority is gone.
       options.signal?.throwIfAborted();
+      options.assertWorkspaceHeld?.();
       return children.add(
         options.command.spawn(input.args, input.options, {
           credentialFenceFds,
