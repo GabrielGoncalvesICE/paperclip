@@ -328,7 +328,6 @@ export async function openCodexAcpxRuntime(
     options.retainFailedAdmissionCleanup(cleanupProof);
     retainCleanup(cleanupProof);
     if (cleanupErrors.length > 0) {
-      retainCleanup(admissionCleanup.runRetained(cleanupHandle, cleanupReason));
       throw new AggregateError(
         [error, ...cleanupErrors],
         "ACPX session handshake and runtime cleanup failed",
@@ -360,7 +359,6 @@ export async function openCodexAcpxRuntime(
     options.retainFailedAdmissionCleanup(cleanupProof);
     retainCleanup(cleanupProof);
     if (cleanupErrors.length > 0) {
-      retainCleanup(admissionCleanup.runRetained(handle, cleanupReason));
       throw new AggregateError(
         [error, ...cleanupErrors],
         "ACPX runtime identity validation and cleanup failed",
@@ -767,13 +765,13 @@ function runtimePort(
   let runtimeCloseAttemptReconciliationGeneration = 0;
   let lateReconciliationOwner: Promise<void> | undefined;
   // This is a lifetime budget for the port, not a per-failure-generation
-  // budget. A released attempt may settle after a newer close succeeds, so
-  // replenishing the counter on success would let each older attempt create a
+  // budget. A pending attempt may settle after its caller-facing timeout, so
+  // replenishing the counter on success would let each late failure create a
   // fresh fully budgeted reconciliation loop.
   let lateReconciliationAttempts = 0;
   let lateFailureGeneration = 0;
   let reconciledLateFailureGeneration = 0;
-  const watchedReleasedAttempts = new Set<Promise<unknown | null>>();
+  const watchedPendingAttempts = new Set<Promise<unknown | null>>();
 
   const hasUnreconciledLateFailure = (): boolean =>
     reconciledLateFailureGeneration < lateFailureGeneration;
@@ -821,10 +819,10 @@ function runtimePort(
     processCleanupSucceeded: boolean,
     reconciliationGeneration: number,
   ): void => {
-    if (watchedReleasedAttempts.has(attempt)) return;
-    watchedReleasedAttempts.add(attempt);
+    if (watchedPendingAttempts.has(attempt)) return;
+    watchedPendingAttempts.add(attempt);
     void attempt.then((error) => {
-      watchedReleasedAttempts.delete(attempt);
+      watchedPendingAttempts.delete(attempt);
       if (runtimeCloseAttempt === attempt) runtimeCloseAttempt = undefined;
       if (error === null) {
         if (processCleanupSucceeded) {
