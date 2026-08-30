@@ -51,6 +51,7 @@ interface QuarantinedCredentialCleanup {
   path: string;
   home: string;
   intentPath: string;
+  ownerGeneration: CredentialLeaseGeneration;
   lock: CredentialHomeLock;
   recovery: Promise<void> | null;
 }
@@ -109,10 +110,13 @@ export async function stageManagedCodexCredential(input: {
   ) {
     throw new Error("Managed Codex credential home permissions are unsafe");
   }
+  // Join an older failed close before claiming the next generation. This
+  // keeps quarantine recovery authoritative over the shared paths without
+  // mistaking a waiting admission for an already-active successor.
+  await recoverQuarantinedCredentialCleanup(join(home, "auth.json"), home);
   const ownerGeneration = claimCredentialLeaseGeneration(home);
   let lock: CredentialHomeLock | null = null;
   try {
-    await recoverQuarantinedCredentialCleanup(join(home, "auth.json"), home);
     lock = await acquireCredentialHomeLock(home);
     return await stageClaimedManagedCodexCredential(
       input,
@@ -210,7 +214,13 @@ async function stageClaimedManagedCodexCredential(
       // Rename may already have installed the credential before directory
       // durability failed. Retain a bounded process owner and the persisted
       // intent so later staging must recover both before admission.
-      quarantineCredentialCleanup(destination, home, intentPath, lock);
+      quarantineCredentialCleanup(
+        destination,
+        home,
+        intentPath,
+        ownerGeneration,
+        lock,
+      );
       throw error;
     }
   } finally {
@@ -690,6 +700,7 @@ function quarantineCredentialCleanup(
   path: string,
   home: string,
   intentPath: string,
+  ownerGeneration: CredentialLeaseGeneration,
   lock: CredentialHomeLock,
 ): void {
   const existing = quarantinedCredentialCleanups.get(home);
@@ -698,6 +709,7 @@ function quarantineCredentialCleanup(
     path,
     home,
     intentPath,
+    ownerGeneration,
     lock,
     recovery: null,
   };
@@ -719,13 +731,16 @@ function startCredentialCleanupRecovery(
       try {
         // Never let a stale cleanup callback mutate a successor's credential
         // after kernel ownership has been lost.
-        cleanup.lock.assertHeld();
+        assertCredentialCleanupAuthority(cleanup);
         await removeReplaceableCredential(cleanup.path);
+        assertCredentialCleanupAuthority(cleanup);
         await syncDirectory(cleanup.home);
+        assertCredentialCleanupAuthority(cleanup);
         await removeCredentialCleanupIntent(
           cleanup.intentPath,
           cleanup.home,
         );
+        assertCredentialCleanupAuthority(cleanup);
         await cleanup.lock.release();
         quarantinedCredentialCleanups.delete(cleanup.home);
         return;
@@ -744,6 +759,21 @@ function startCredentialCleanupRecovery(
     if (cleanup.recovery === recovery) cleanup.recovery = null;
   }).catch(() => undefined);
   return recovery;
+}
+
+function assertCredentialCleanupAuthority(
+  cleanup: QuarantinedCredentialCleanup,
+): void {
+  const activeGeneration = activeCredentialLeaseGenerations.get(cleanup.home);
+  if (
+    activeGeneration !== undefined &&
+    activeGeneration !== cleanup.ownerGeneration
+  ) {
+    throw new Error(
+      "Managed Codex credential cleanup was superseded by an active lease",
+    );
+  }
+  cleanup.lock.assertHeld();
 }
 
 async function recoverQuarantinedCredentialCleanup(
@@ -813,7 +843,13 @@ function credentialLease(
           await lock.release();
           closed = true;
         } catch (error) {
-          quarantineCredentialCleanup(path, home, intentPath, lock);
+          quarantineCredentialCleanup(
+            path,
+            home,
+            intentPath,
+            ownerGeneration,
+            lock,
+          );
           throw error;
         } finally {
           releaseCredentialLeaseGeneration(home, ownerGeneration);

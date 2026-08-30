@@ -402,6 +402,79 @@ describe("managed Codex credentials", () => {
     await secondLease.close();
   });
 
+  it("fences successor admission while an older lock release fails", async () => {
+    const fixture = await credentialFixture();
+    const actualFs = await vi.importActual<typeof import("node:fs/promises")>(
+      "node:fs/promises",
+    );
+    let markerUnlinkAttempts = 0;
+    let signalMarkerReleaseStarted!: () => void;
+    const markerReleaseStarted = new Promise<void>((resolveStarted) => {
+      signalMarkerReleaseStarted = resolveStarted;
+    });
+    let failMarkerRelease!: () => void;
+    const markerReleaseFailureGate = new Promise<void>((resolveFailure) => {
+      failMarkerRelease = resolveFailure;
+    });
+    vi.doMock("node:fs/promises", () => ({
+      ...actualFs,
+      unlink: async (path: Parameters<typeof actualFs.unlink>[0]) => {
+        if (String(path).includes(".paperclip-auth-lease-v1-")) {
+          markerUnlinkAttempts += 1;
+          if (markerUnlinkAttempts === 1) {
+            signalMarkerReleaseStarted();
+            await markerReleaseFailureGate;
+            throw Object.assign(new Error("injected marker unlink failure"), {
+              code: "EACCES",
+            });
+          }
+        }
+        await actualFs.unlink(path);
+      },
+    }));
+    vi.resetModules();
+    const freshCredentials = await import("./codex-credentials.js");
+    const firstLease = await freshCredentials.stageManagedCodexCredential({
+      agentHomeDirectory: fixture.home,
+      environment: {
+        PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: '{"owner":"first"}',
+      },
+    });
+
+    const firstClose = firstLease.close();
+    try {
+      await markerReleaseStarted;
+      await expect(
+        freshCredentials.stageManagedCodexCredential({
+          agentHomeDirectory: fixture.home,
+          environment: {
+            PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: '{"owner":"overlap"}',
+          },
+        }),
+      ).rejects.toThrow("already has an active lease");
+
+      failMarkerRelease();
+      await expect(firstClose).rejects.toThrow(
+        "injected marker unlink failure",
+      );
+      const successor = await freshCredentials.stageManagedCodexCredential({
+        agentHomeDirectory: fixture.home,
+        environment: {
+          PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: '{"owner":"successor"}',
+        },
+      });
+      await expect(firstLease.close()).resolves.toBeUndefined();
+      await expect(readFile(successor.path, "utf8")).resolves.toBe(
+        '{"owner":"successor"}',
+      );
+      await successor.close();
+      expect(markerUnlinkAttempts).toBeGreaterThanOrEqual(2);
+    } finally {
+      failMarkerRelease();
+      await firstClose.catch(() => undefined);
+    }
+  });
+
   it("keeps ownership live while retrying lease-marker removal", async () => {
     const fixture = await credentialFixture();
     const actualFs = await vi.importActual<typeof import("node:fs/promises")>(
