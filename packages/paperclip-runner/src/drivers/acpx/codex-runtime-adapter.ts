@@ -203,6 +203,7 @@ export async function openCodexAcpxRuntime(
       // credential. Give the provider a dedicated POSIX process group so
       // cleanup authority covers that complete credential-bearing tree.
       const processGroup = process.platform !== "win32";
+      options.assertWorkspaceHeld?.();
       return children.add(
         options.command.spawn(input.args, {
           ...input.options,
