@@ -2013,7 +2013,7 @@ function safeMessage(error: unknown): string {
 }
 
 function reportRetainedAcpxCleanupFailure(input: {
-  resource: "credential" | "command" | "runtime";
+  resource: "credential" | "command" | "runtime" | "tool_bridge";
   attempt: number;
   error: unknown;
 }): void {

@@ -66,6 +66,26 @@ import {
 const MAX_PENDING_TOOLS = 512;
 const MAX_PENDING_INPUTS = 16;
 
+function reportRetainedAcpxCleanupFailure(input: {
+  resource: "credential" | "command" | "runtime" | "tool_bridge";
+  attempt: number;
+  error: unknown;
+}): void {
+  const errorName = input.error instanceof Error ? input.error.name : "Error";
+  process.emitWarning(
+    JSON.stringify({
+      schema: "paperclip.runner.retained_cleanup_failure.v1",
+      resource: input.resource,
+      attempt: input.attempt,
+      errorName,
+    }),
+    {
+      code: "PAPERCLIP_ACPX_RETAINED_CLEANUP_FAILURE",
+      type: "PaperclipRunnerCleanupWarning",
+    },
+  );
+}
+
 interface PendingTool {
   turnId: string;
   settle(value: unknown): void;
@@ -222,6 +242,7 @@ async function dispatch(
       },
       {
         retainAdmissionCleanup: retainFailedAdmissionCleanup,
+        reportRetainedCleanupFailure: reportRetainedAcpxCleanupFailure,
         openRuntime: (options) =>
           openCodexAcpxRuntime(options, {
             retainCleanup: retainFailedAdmissionCleanup,
