@@ -553,6 +553,62 @@ describe("Codex ACPX runtime adapter", () => {
     }
   });
 
+  it("gives each late failure generation a bounded reconciliation budget", async () => {
+    vi.useFakeTimers();
+    try {
+      const runtime = fakeRuntime();
+      let rejectInitialClose!: (error: unknown) => void;
+      const initialClose = new Promise<void>((_resolve, reject) => {
+        rejectInitialClose = reject;
+      });
+      let rejectNewerClose!: (error: unknown) => void;
+      const newerClose = new Promise<void>((_resolve, reject) => {
+        rejectNewerClose = reject;
+      });
+      vi.mocked(runtime.close)
+        .mockReturnValueOnce(initialClose)
+        .mockRejectedValueOnce(new Error("reconciliation 1 failed"))
+        .mockRejectedValueOnce(new Error("reconciliation 2 failed"))
+        .mockRejectedValueOnce(new Error("reconciliation 3 failed"))
+        .mockReturnValueOnce(newerClose)
+        .mockResolvedValueOnce(undefined);
+      const port = await openCodexAcpxRuntime(openOptions(fakeCommand()), {
+        createRegistry: () => registry(),
+        createStore: () => store(),
+        createRuntime: () => runtime,
+        runtimeCloseTimeoutMs: 1,
+      });
+
+      const firstClose = expect(
+        port.close({ reason: "first protocol close stalls" }),
+      ).rejects.toThrow("ACPX runtime and provider cleanup failed");
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(1);
+      await firstClose;
+      rejectInitialClose(new Error("initial close failed late"));
+      await vi.waitFor(() => expect(runtime.close).toHaveBeenCalledTimes(4));
+      await vi.advanceTimersByTimeAsync(0);
+
+      const secondClose = expect(
+        port.close({ reason: "newer protocol close stalls" }),
+      ).rejects.toThrow("ACPX runtime and provider cleanup failed");
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(1);
+      await secondClose;
+      expect(runtime.close).toHaveBeenCalledTimes(5);
+
+      rejectNewerClose(new Error("newer close failed late"));
+      await vi.waitFor(() => expect(runtime.close).toHaveBeenCalledTimes(6));
+      expect(runtime.close).toHaveBeenLastCalledWith({
+        handle: HANDLE,
+        reason: "ACPX late protocol cleanup reconciliation 1",
+        discardPersistentState: false,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("marks a retained protocol close terminal when it succeeds late", async () => {
     vi.useFakeTimers();
     try {

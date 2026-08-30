@@ -646,10 +646,10 @@ function runtimePort(
   let runtimeCloseAttempt: Promise<unknown | null> | undefined;
   let runtimeCloseAttemptReconciliationGeneration = 0;
   let lateReconciliationOwner: Promise<void> | undefined;
-  // This is a lifetime budget for the port, not a per-failure-generation
-  // budget. A released attempt may settle after a newer close succeeds, so
-  // replenishing the counter on success would let each older attempt create a
-  // fresh fully budgeted reconciliation loop.
+  // Each independently observed late failure receives a bounded reconciliation
+  // budget. Exhausting retries for an older generation must not prevent a newer
+  // late failure from acquiring its own recovery owner.
+  let lateReconciliationAttemptGeneration = 0;
   let lateReconciliationAttempts = 0;
   let lateFailureGeneration = 0;
   let reconciledLateFailureGeneration = 0;
@@ -662,12 +662,21 @@ function runtimePort(
     if (
       runtimeCloseAttempt ||
       lateReconciliationOwner ||
-      !hasUnreconciledLateFailure() ||
+      !hasUnreconciledLateFailure()
+    ) {
+      return;
+    }
+    if (lateReconciliationAttemptGeneration !== lateFailureGeneration) {
+      lateReconciliationAttemptGeneration = lateFailureGeneration;
+      lateReconciliationAttempts = 0;
+    }
+    if (
       lateReconciliationAttempts >=
         MAX_LATE_RUNTIME_CLEANUP_RECONCILIATION_ATTEMPTS
     ) {
       return;
     }
+    const attemptGeneration = lateFailureGeneration;
     const attemptNumber = lateReconciliationAttempts + 1;
     lateReconciliationAttempts = attemptNumber;
     let retry = false;
@@ -677,11 +686,13 @@ function runtimePort(
       () => {
         if (hasUnreconciledLateFailure()) {
           retry =
+            lateFailureGeneration === attemptGeneration &&
             attemptNumber < MAX_LATE_RUNTIME_CLEANUP_RECONCILIATION_ATTEMPTS;
         }
       },
       () => {
         retry =
+          lateFailureGeneration === attemptGeneration &&
           attemptNumber < MAX_LATE_RUNTIME_CLEANUP_RECONCILIATION_ATTEMPTS;
       },
     );
