@@ -18721,6 +18721,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return mergedRun;
     }
 
+    const queuedContextSnapshot = shouldQueueFollowupForRunningWake && sameScopeRunningRun
+      ? { ...enrichedContextSnapshot, queuedAsFollowupToRunId: sameScopeRunningRun.id }
+      : enrichedContextSnapshot;
+
     const queueOutcome = await db.transaction(async (tx) => {
       await tx.execute(
         sql`select id from agents where id = ${agentId} and company_id = ${agent.companyId} for update`,
@@ -18788,7 +18792,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           status: "queued",
           responsibleUserId: await resolveQueuedResponsibleUserId(),
           wakeupRequestId: wakeupRequest.id,
-          contextSnapshot: enrichedContextSnapshot,
+          contextSnapshot: queuedContextSnapshot,
           sessionIdBefore: sessionBefore,
           continuationAttempt,
         })
@@ -18966,7 +18970,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             eq(heartbeatRuns.companyId, run.companyId),
             eq(heartbeatRuns.agentId, run.agentId),
             eq(heartbeatRuns.status, "queued"),
-            sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+            sql`${heartbeatRuns.contextSnapshot} ->> 'queuedAsFollowupToRunId' = ${run.id}`,
             sql`${heartbeatRuns.id} <> ${run.id}`,
           ),
         )
