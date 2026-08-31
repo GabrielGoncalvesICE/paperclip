@@ -5374,6 +5374,125 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(linkedStatusEvents.at(-1)).toBe("cancelled");
   });
 
+  it("preserves a target that finishes before serialized cancellation wins its status CAS", async () => {
+    const { issueId, runId, wakeupRequestId } = await seedRunFixture({
+      agentStatus: "running",
+      includeIssue: true,
+    });
+    let releaseIssueLock: (() => void) | null = null;
+    let issueLocked: (() => void) | null = null;
+    const issueLockAcquired = new Promise<void>((resolve) => {
+      issueLocked = resolve;
+    });
+    const holdIssueLock = db.transaction(async (tx) => {
+      await tx.execute(sql`select id from issues where id = ${issueId} for update`);
+      issueLocked?.();
+      await new Promise<void>((resolve) => {
+        releaseIssueLock = resolve;
+      });
+    });
+    await issueLockAcquired;
+
+    const heartbeat = heartbeatService(db);
+    const cancellation = heartbeat.cancelRun(runId, "Cancelled by a board operator", {
+      suppressImmediateRecovery: true,
+      suppressDeferredPromotion: true,
+      resultJson: { cancelledByActorType: "user" },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt: new Date(), updatedAt: new Date() })
+      .where(eq(heartbeatRuns.id, runId));
+    releaseIssueLock?.();
+    await holdIssueLock;
+
+    await expect(cancellation).resolves.toMatchObject({ id: runId, status: "succeeded" });
+    expect((await heartbeat.getRun(runId))?.status).toBe("succeeded");
+    expect(await db
+      .select({ status: agentWakeupRequests.status })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, wakeupRequestId))
+      .then((rows) => rows[0]?.status)).toBe("claimed");
+    expect(mockTerminateLocalService).not.toHaveBeenCalled();
+  });
+
+  it("preserves a linked run that finishes after cancellation selects it", async () => {
+    const { companyId, agentId, issueId, runId } = await seedRunFixture({
+      agentStatus: "running",
+      includeIssue: true,
+    });
+    const linkedWakeupId = randomUUID();
+    const linkedRunId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: linkedWakeupId,
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId },
+      status: "claimed",
+      runId: linkedRunId,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: linkedRunId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "running",
+      wakeupRequestId: linkedWakeupId,
+      contextSnapshot: { issueId, queuedAsFollowupToRunId: runId },
+      startedAt: new Date(),
+    });
+
+    let finishLinkedRun: (() => void) | null = null;
+    let linkedRunLocked: (() => void) | null = null;
+    const linkedRunLockAcquired = new Promise<void>((resolve) => {
+      linkedRunLocked = resolve;
+    });
+    const finishLinkedWhileLocked = db.transaction(async (tx) => {
+      await tx.execute(sql`select id from heartbeat_runs where id = ${linkedRunId} for update`);
+      linkedRunLocked?.();
+      await new Promise<void>((resolve) => {
+        finishLinkedRun = resolve;
+      });
+      await tx
+        .update(heartbeatRuns)
+        .set({ status: "failed", finishedAt: new Date(), updatedAt: new Date() })
+        .where(eq(heartbeatRuns.id, linkedRunId));
+    });
+    await linkedRunLockAcquired;
+
+    const heartbeat = heartbeatService(db);
+    const cancellation = heartbeat.cancelRun(runId, "Cancelled by a board operator", {
+      suppressImmediateRecovery: true,
+      suppressDeferredPromotion: true,
+      resultJson: { cancelledByActorType: "user" },
+    });
+    await waitForValue(async () => {
+      try {
+        await db.transaction((tx) =>
+          tx.execute(sql`select id from issues where id = ${issueId} for update nowait`)
+        );
+        return null;
+      } catch {
+        return true;
+      }
+    });
+    finishLinkedRun?.();
+    await finishLinkedWhileLocked;
+    await expect(cancellation).resolves.toMatchObject({ id: runId, status: "cancelled" });
+
+    expect((await heartbeat.getRun(linkedRunId))?.status).toBe("failed");
+    expect(await db
+      .select({ status: agentWakeupRequests.status })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, linkedWakeupId))
+      .then((rows) => rows[0]?.status)).toBe("claimed");
+  });
+
   it("persists cancellation quarantine before termination and reaps it after service map loss", async () => {
     const { companyId, agentId, issueId, runId } = await seedRunFixture({
       agentStatus: "running",

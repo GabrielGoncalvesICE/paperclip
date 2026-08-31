@@ -19979,7 +19979,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           } : {}),
           updatedAt: now,
         })
-        .where(eq(heartbeatRuns.id, run.id))
+        .where(and(
+          eq(heartbeatRuns.id, run.id),
+          eq(heartbeatRuns.status, run.status),
+        ))
         .returning()
         .then((rows) => rows[0] ?? null);
       if (!updated) return null;
@@ -20019,7 +20022,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             } : {}),
             updatedAt: now,
           })
-          .where(eq(heartbeatRuns.id, successorRun.id))
+          .where(and(
+            eq(heartbeatRuns.id, successorRun.id),
+            eq(heartbeatRuns.status, successorRun.status),
+          ))
           .returning()
           .then((rows) => rows[0]);
         if (updatedSuccessor) successorRuns.push(updatedSuccessor);
@@ -20152,6 +20158,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       : null;
     let cancelled = issueCancellation?.cancelled ?? null;
     const successorTerminationFailed = issueCancellation?.successorTerminationFailed ?? false;
+    if (issueCancellation && !cancelled) {
+      return (await getRun(runId)) ?? run;
+    }
     const targetHasPendingCleanup = Boolean(
       parseObject(cancelled?.resultJson).operatorCancellationTerminationPending,
     );
