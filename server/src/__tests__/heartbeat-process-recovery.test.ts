@@ -4819,7 +4819,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   });
 
   it("preserves a target that finishes before serialized cancellation wins its status CAS", async () => {
-    const { issueId, runId, wakeupRequestId } = await seedRunFixture({
+    const { companyId, issueId, runId, wakeupRequestId } = await seedRunFixture({
       agentStatus: "running",
       includeIssue: true,
     });
@@ -4838,6 +4838,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await issueLockAcquired;
 
     const heartbeat = heartbeatService(db);
+    const targetStatusEvents: string[] = [];
+    const unsubscribe = subscribeCompanyLiveEvents(companyId, (event) => {
+      const payload = event.payload as { runId?: string; status?: string };
+      if (event.type === "heartbeat.run.status" && payload.runId === runId && payload.status) {
+        targetStatusEvents.push(payload.status);
+      }
+    });
     const cancellation = heartbeat.cancelRun(runId, "Cancelled by a board operator", {
       suppressImmediateRecovery: true,
       suppressDeferredPromotion: true,
@@ -4846,19 +4853,31 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await new Promise((resolve) => setTimeout(resolve, 50));
     await db
       .update(heartbeatRuns)
-      .set({ status: "succeeded", finishedAt: new Date(), updatedAt: new Date() })
+      .set({
+        status: "succeeded",
+        resultJson: { completionReceipt: "target-finished" },
+        finishedAt: new Date(),
+        updatedAt: new Date(),
+      })
       .where(eq(heartbeatRuns.id, runId));
     releaseIssueLock?.();
     await holdIssueLock;
 
     await expect(cancellation).resolves.toMatchObject({ id: runId, status: "succeeded" });
-    expect((await heartbeat.getRun(runId))?.status).toBe("succeeded");
+    expect(await heartbeat.getRun(runId)).toMatchObject({
+      status: "succeeded",
+      resultJson: { completionReceipt: "target-finished" },
+      error: null,
+      errorCode: null,
+    });
     expect(await db
       .select({ status: agentWakeupRequests.status })
       .from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.id, wakeupRequestId))
       .then((rows) => rows[0]?.status)).toBe("claimed");
     expect(mockTerminateLocalService).not.toHaveBeenCalled();
+    expect(targetStatusEvents).not.toContain("cancelled");
+    unsubscribe();
   });
 
   it("preserves a linked run that finishes after cancellation selects it", async () => {
@@ -4904,12 +4923,26 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       });
       await tx
         .update(heartbeatRuns)
-        .set({ status: "failed", finishedAt: new Date(), updatedAt: new Date() })
+        .set({
+          status: "failed",
+          error: "adapter completed with a terminal failure",
+          errorCode: "adapter_terminal_failure",
+          resultJson: { completionReceipt: "linked-failed" },
+          finishedAt: new Date(),
+          updatedAt: new Date(),
+        })
         .where(eq(heartbeatRuns.id, linkedRunId));
     });
     await linkedRunLockAcquired;
 
     const heartbeat = heartbeatService(db);
+    const linkedStatusEvents: string[] = [];
+    const unsubscribe = subscribeCompanyLiveEvents(companyId, (event) => {
+      const payload = event.payload as { runId?: string; status?: string };
+      if (event.type === "heartbeat.run.status" && payload.runId === linkedRunId && payload.status) {
+        linkedStatusEvents.push(payload.status);
+      }
+    });
     const cancellation = heartbeat.cancelRun(runId, "Cancelled by a board operator", {
       suppressImmediateRecovery: true,
       suppressDeferredPromotion: true,
@@ -4929,12 +4962,19 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await finishLinkedWhileLocked;
     await expect(cancellation).resolves.toMatchObject({ id: runId, status: "cancelled" });
 
-    expect((await heartbeat.getRun(linkedRunId))?.status).toBe("failed");
+    expect(await heartbeat.getRun(linkedRunId)).toMatchObject({
+      status: "failed",
+      error: "adapter completed with a terminal failure",
+      errorCode: "adapter_terminal_failure",
+      resultJson: { completionReceipt: "linked-failed" },
+    });
     expect(await db
       .select({ status: agentWakeupRequests.status })
       .from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.id, linkedWakeupId))
       .then((rows) => rows[0]?.status)).toBe("claimed");
+    expect(linkedStatusEvents).not.toContain("cancelled");
+    unsubscribe();
   });
 
   it("persists cancellation quarantine before termination and reaps it after service map loss", async () => {
