@@ -5760,7 +5760,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(await heartbeat.getRun(runId)).toMatchObject({
       status: "cancelled",
       processPid: 23456,
-      resultJson: expect.objectContaining({ operatorCancellationTerminationPending: true }),
+      resultJson: expect.objectContaining({
+        operatorCancellationTerminationPending: true,
+        operatorCancellationSuppressDeferredPromotion: true,
+      }),
     });
     expect(await db
       .select({ status: agentWakeupRequests.status })
@@ -5773,6 +5776,17 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0]?.executionRunId)).toBe(runId);
 
+    const sameAgentDeferredWakeId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: sameAgentDeferredWakeId,
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_execution_deferred",
+      payload: { issueId },
+      status: "deferred_issue_execution",
+    });
     await db
       .update(issues)
       .set({ assigneeAgentId: peerAgentId })
@@ -5830,6 +5844,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await peerAdapterStartBarrier;
     expect(((await restartedHeartbeat.getRun(runId))?.resultJson as Record<string, unknown> | null)
       ?.operatorCancellationTerminationPending).toBeUndefined();
+    expect(await db
+      .select({ status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, sameAgentDeferredWakeId))
+      .then((rows) => rows[0])).toEqual({ status: "cancelled", runId: null });
     const promotedPeerRunId = await db
       .select({ runId: agentWakeupRequests.runId })
       .from(agentWakeupRequests)
