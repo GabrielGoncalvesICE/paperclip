@@ -14048,6 +14048,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         payload: buildHeartbeatRunStatusLiveEventPayload(cleanedRun),
       });
       publishRunLifecyclePluginEvent(cleanedRun);
+      await releaseIssueExecutionAndPromote(cleanedRun, {
+        suppressImmediateRecovery: true,
+      });
       await finalizeAgentStatus(cleanedRun.agentId, "cancelled");
       await startNextQueuedRunForAgent(cleanedRun.agentId);
       reaped.push(cleanedRun.id);
@@ -19026,9 +19029,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             .where(eq(heartbeatRuns.id, issue.executionRunId))
             .then((rows) => rows[0] ?? null)
           : null;
+        const activeExecutionCleanupPending = Boolean(
+          parseObject(activeExecutionRun?.resultJson).operatorCancellationTerminationPending,
+        );
 
         if (
           activeExecutionRun &&
+          !activeExecutionCleanupPending &&
           !EXECUTION_PATH_HEARTBEAT_RUN_STATUSES.includes(
             activeExecutionRun.status as (typeof EXECUTION_PATH_HEARTBEAT_RUN_STATUSES)[number],
           )
@@ -19057,6 +19064,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // normally against the now-running holder.
         if (
           activeExecutionRun &&
+          !activeExecutionCleanupPending &&
           activeExecutionRun.status !== "running" &&
           issue.assigneeAgentId &&
           activeExecutionRun.agentId !== issue.assigneeAgentId
@@ -20032,7 +20040,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .where(inArray(agentWakeupRequests.id, wakeupRequestIds));
       }
 
-      const cancelledRunIds = [updated.id, ...successorRuns.map((successorRun) => successorRun.id)];
+      // A live target with pending termination keeps owning the issue lock until
+      // the reaper verifies cleanup. Clearing it here would let a reassigned peer
+      // enter the same issue while the old adapter may still be executing.
+      const cancelledRunIds = [
+        ...(!targetTerminationPending ? [updated.id] : []),
+        ...successorRuns.map((successorRun) => successorRun.id),
+      ];
       if (cancelledRunIds.length > 0) {
         await tx
           .update(issues)
