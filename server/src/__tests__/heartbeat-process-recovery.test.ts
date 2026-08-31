@@ -4736,7 +4736,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       contextSnapshot: { issueId, wakeReason: "issue_assigned", queuedAsFollowupToRunId: runId },
     });
 
-    mockTerminateLocalService.mockResolvedValueOnce(undefined);
+    mockTerminateLocalService.mockResolvedValue(undefined);
+    runningProcesses.set(runId, {
+      child: { pid: 12344 } as ChildProcess,
+      graceSec: 1,
+      processGroupId: null,
+    });
+
     const linkedStatusEvents: string[] = [];
     const unsubscribe = subscribeCompanyLiveEvents(companyId, (event) => {
       const payload = event.payload as { runId?: string; status?: string };
@@ -4832,10 +4838,30 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0]);
     expect(issue?.executionRunId).toBeNull();
-    expect(mockTerminateLocalService).toHaveBeenCalledTimes(1);
+    expect(mockTerminateLocalService).toHaveBeenCalledTimes(2);
     expect(runningProcesses.has(linkedRunId)).toBe(false);
     expect(mockAdapterExecute.mock.calls.filter(([ctx]) => ctx?.runId === linkedRunId)).toHaveLength(0);
     expect(linkedStatusEvents.at(-1)).toBe("cancelled");
+
+    for (const cleanedRunId of [runId, linkedRunId]) {
+      const cleanedResult = (await heartbeat.getRun(cleanedRunId))?.resultJson as
+        | Record<string, unknown>
+        | null;
+      expect(cleanedResult?.operatorCancellationTerminationPending).toBeUndefined();
+      expect(cleanedResult?.operatorCancellationTerminationAcknowledged).toBeUndefined();
+      expect(cleanedResult?.operatorCancellationSuppressDeferredPromotion).toBeUndefined();
+    }
+
+    const redispatched = await heartbeat.wakeup(agentId, {
+      source: "on_demand",
+      triggerDetail: "manual",
+      reason: "post_cancel_explicit_redispatch",
+      contextSnapshot: { wakeReason: "manual" },
+    });
+    expect(redispatched).not.toBeNull();
+    expect(await waitForRunToSettle(heartbeat, redispatched!.id)).toMatchObject({
+      status: "succeeded",
+    });
   });
 
   it("preserves a target that finishes before serialized cancellation wins its status CAS", async () => {
