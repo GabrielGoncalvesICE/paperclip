@@ -13506,7 +13506,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
 
       const resultJson = parseObject(pendingRun.resultJson);
+      const suppressDeferredPromotion =
+        resultJson.operatorCancellationSuppressDeferredPromotion === true;
       delete resultJson.operatorCancellationTerminationPending;
+      delete resultJson.operatorCancellationSuppressDeferredPromotion;
       const cleanedRun = await db
         .update(heartbeatRuns)
         .set({ resultJson, updatedAt: now })
@@ -13523,6 +13526,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       publishRunLifecyclePluginEvent(cleanedRun);
       await releaseIssueExecutionAndPromote(cleanedRun, {
         suppressImmediateRecovery: true,
+        suppressDeferredPromotion,
+        promoteOtherAgentsAfterDeferredSuppression: suppressDeferredPromotion,
       });
       await finalizeAgentStatus(cleanedRun.agentId, "cancelled");
       await startNextQueuedRunForAgent(cleanedRun.agentId);
@@ -16872,6 +16877,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     options: {
       suppressImmediateRecovery?: boolean;
       suppressDeferredPromotion?: boolean;
+      promoteOtherAgentsAfterDeferredSuppression?: boolean;
     } = {},
   ) {
     const runContext = parseObject(run.contextSnapshot);
@@ -17031,10 +17037,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             ),
           );
 
-        // Exact-run operator cancellation suppresses this agent's deferred
-        // continuation; it must not then promote another agent's wake for the
-        // same issue as a side effect of releasing the cancelled run.
-        return null;
+        // Exact-run operator cancellation always suppresses this agent's deferred
+        // continuation. Normal release stops here; verified reaping may continue
+        // to a different agent's deferred handoff after the old process is gone.
+        if (!options.promoteOtherAgentsAfterDeferredSuppression) return null;
       }
 
       while (true) {
@@ -19057,6 +19063,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             resultJson: {
               ...parseObject(patch.resultJson),
               operatorCancellationTerminationPending: true,
+              operatorCancellationSuppressDeferredPromotion: true,
             },
           } : {}),
           updatedAt: now,
@@ -19100,6 +19107,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               resultJson: {
                 ...parseObject(successorRun.resultJson),
                 operatorCancellationTerminationPending: true,
+                operatorCancellationSuppressDeferredPromotion: true,
               },
             } : {}),
             updatedAt: now,
@@ -19180,6 +19188,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (!terminationFailed) {
           const resultJson = parseObject(successorRun.resultJson);
           delete resultJson.operatorCancellationTerminationPending;
+          delete resultJson.operatorCancellationSuppressDeferredPromotion;
           const terminatedRun = await db
             .update(heartbeatRuns)
             .set({ resultJson, updatedAt: new Date() })
@@ -19276,6 +19285,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (cancelled && targetHasPendingCleanup && !targetTerminationFailed) {
       const cleanedResultJson = parseObject(cancelled.resultJson);
       delete cleanedResultJson.operatorCancellationTerminationPending;
+      delete cleanedResultJson.operatorCancellationSuppressDeferredPromotion;
       cancelled = await db
         .update(heartbeatRuns)
         .set({ resultJson: cleanedResultJson, updatedAt: new Date() })
