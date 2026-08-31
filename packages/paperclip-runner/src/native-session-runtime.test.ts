@@ -1374,14 +1374,15 @@ describe("executeNativeSession recovery", () => {
       // resources. A replacement bootstrap cannot start concurrently.
       await vi.advanceTimersByTimeAsync(101);
       const blockedAdmission = execute();
+      const blockedAdmissionRejection = expect(blockedAdmission).rejects.toThrow(
+        "replacement bootstrap launched",
+      );
       await vi.advanceTimersByTimeAsync(1_000);
       expect(openSession).toHaveBeenCalledOnce();
 
       releaseClose();
       await vi.advanceTimersByTimeAsync(0);
-      await expect(blockedAdmission).rejects.toThrow(
-        "replacement bootstrap launched",
-      );
+      await blockedAdmissionRejection;
       expect(openSession).toHaveBeenCalledTimes(2);
       expect(openRun).not.toHaveBeenCalled();
     } finally {
@@ -3024,7 +3025,7 @@ describe("executeNativeSession recovery", () => {
       async descriptor() {
         return {
           kind: "mock",
-          name: "existing-backend",
+          name: "attachment-failure-backend",
           version: "1",
           capabilities: {
             resume: true,
@@ -3107,7 +3108,7 @@ describe("executeNativeSession recovery", () => {
       async descriptor() {
         return {
           kind: "mock",
-          name: "existing-backend",
+          name: "control-plane-admission-failure-backend",
           version: "1",
           capabilities: {
             resume: true,

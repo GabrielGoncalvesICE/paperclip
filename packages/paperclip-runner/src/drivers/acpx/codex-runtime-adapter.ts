@@ -642,9 +642,18 @@ function runtimePort(
   children: SpawnedChildSet,
   runtimeCloseTimeoutMs: number,
 ): AcpxRuntimePort {
+  type RuntimeCloseAttempt = {
+    readonly outcome: Promise<unknown | null>;
+    readonly reconciliationGeneration: number;
+    readonly origin:
+      | { readonly kind: "external" }
+      | {
+          readonly kind: "reconciliation";
+          readonly generation: number;
+        };
+  };
   let runtimeClosed = false;
-  let runtimeCloseAttempt: Promise<unknown | null> | undefined;
-  let runtimeCloseAttemptReconciliationGeneration = 0;
+  let runtimeCloseAttempt: RuntimeCloseAttempt | undefined;
   let lateReconciliationOwner: Promise<void> | undefined;
   // Each independently observed late failure receives a bounded reconciliation
   // budget. Exhausting retries for an older generation must not prevent a newer
@@ -653,7 +662,7 @@ function runtimePort(
   let lateReconciliationAttempts = 0;
   let lateFailureGeneration = 0;
   let reconciledLateFailureGeneration = 0;
-  const watchedReleasedAttempts = new Set<Promise<unknown | null>>();
+  const watchedReleasedAttempts = new Set<RuntimeCloseAttempt>();
 
   const hasUnreconciledLateFailure = (): boolean =>
     reconciledLateFailureGeneration < lateFailureGeneration;
@@ -682,6 +691,7 @@ function runtimePort(
     let retry = false;
     const reconciliation = closeRuntime({
       reason: `ACPX late protocol cleanup reconciliation ${attemptNumber}`,
+      reconciliationGeneration: attemptGeneration,
     }).then(
       () => {
         if (hasUnreconciledLateFailure()) {
@@ -708,20 +718,19 @@ function runtimePort(
   };
 
   const watchPendingAttempt = (
-    attempt: Promise<unknown | null>,
+    attempt: RuntimeCloseAttempt,
     processCleanupSucceeded: boolean,
-    reconciliationGeneration: number,
   ): void => {
     if (watchedReleasedAttempts.has(attempt)) return;
     watchedReleasedAttempts.add(attempt);
-    void attempt.then((error) => {
+    void attempt.outcome.then((error) => {
       watchedReleasedAttempts.delete(attempt);
       if (runtimeCloseAttempt === attempt) runtimeCloseAttempt = undefined;
       if (error === null) {
         if (processCleanupSucceeded) {
           reconciledLateFailureGeneration = Math.max(
             reconciledLateFailureGeneration,
-            reconciliationGeneration,
+            attempt.reconciliationGeneration,
           );
           runtimeClosed = !hasUnreconciledLateFailure();
         }
@@ -731,30 +740,41 @@ function runtimePort(
       // A newer successful close cannot erase an older outcome that had not
       // settled yet. Re-open cleanup state and autonomously create a bounded
       // reconciliation generation so the late failure is not suppression-only.
-      lateFailureGeneration += 1;
+      // Only an externally initiated close creates a new failure generation.
+      // A timed-out autonomous reconciliation remains charged to the budget
+      // of the generation that created it, even when external callers later
+      // coalesce onto that same immutable attempt.
+      if (attempt.origin.kind === "external") lateFailureGeneration += 1;
       runtimeClosed = false;
       scheduleLateFailureReconciliation();
     });
   };
 
-  async function closeRuntime(input: { reason: string }): Promise<void> {
+  async function closeRuntime(input: {
+    reason: string;
+    reconciliationGeneration?: number;
+  }): Promise<void> {
     if (runtimeClosed) return;
     if (!runtimeCloseAttempt) {
       // A close can reconcile only failures already known when its protocol
       // attempt begins. A released older attempt may reject while this one is
       // in flight; that later generation must trigger a subsequent close.
-      runtimeCloseAttemptReconciliationGeneration = lateFailureGeneration;
-      runtimeCloseAttempt = ownedRuntimeCloseOutcome(
-        runtime,
-        handle,
-        input.reason,
-      );
+      runtimeCloseAttempt = {
+        outcome: ownedRuntimeCloseOutcome(runtime, handle, input.reason),
+        reconciliationGeneration:
+          input.reconciliationGeneration ?? lateFailureGeneration,
+        origin:
+          input.reconciliationGeneration === undefined
+            ? { kind: "external" }
+            : {
+                kind: "reconciliation",
+                generation: input.reconciliationGeneration,
+              },
+      };
     }
     const observedAttempt = runtimeCloseAttempt;
-    const observedReconciliationGeneration =
-      runtimeCloseAttemptReconciliationGeneration;
     const processCleanup = terminateChildrenAfterCloseBound(
-      observedAttempt,
+      observedAttempt.outcome,
       children,
       runtimeCloseTimeoutMs,
     );
@@ -762,22 +782,18 @@ function runtimePort(
     // owned and remains this handle's sole close attempt until it settles.
     // Provider termination still proceeds at the deadline.
     const [closeError, processErrors] = await Promise.all([
-      boundedCloseOutcome(observedAttempt, runtimeCloseTimeoutMs),
+      boundedCloseOutcome(observedAttempt.outcome, runtimeCloseTimeoutMs),
       processCleanup,
     ]);
     if (closeError instanceof AcpxRuntimeCloseTimeoutError) {
-      watchPendingAttempt(
-        observedAttempt,
-        processErrors.length === 0,
-        observedReconciliationGeneration,
-      );
+      watchPendingAttempt(observedAttempt, processErrors.length === 0);
     } else if (runtimeCloseAttempt === observedAttempt) {
       runtimeCloseAttempt = undefined;
     }
     if (processErrors.length === 0 && closeError === null) {
       reconciledLateFailureGeneration = Math.max(
         reconciledLateFailureGeneration,
-        observedReconciliationGeneration,
+        observedAttempt.reconciliationGeneration,
       );
       runtimeClosed = !hasUnreconciledLateFailure();
     } else {
