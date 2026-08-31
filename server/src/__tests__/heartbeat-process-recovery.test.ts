@@ -5028,13 +5028,20 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     await heartbeat.cancelRun(runId, "Cancelled by a board operator", {
       suppressImmediateRecovery: true,
+      suppressDeferredPromotion: true,
       resultJson: { cancelledByActorType: "user" },
     });
 
     const successors = await db
       .select({ id: heartbeatRuns.id })
       .from(heartbeatRuns)
-      .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.retryOfRunId, runId)));
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+          sql`${heartbeatRuns.id} <> ${runId}`,
+        ),
+      );
     expect(successors).toHaveLength(0);
 
     const deferredWakeup = await db

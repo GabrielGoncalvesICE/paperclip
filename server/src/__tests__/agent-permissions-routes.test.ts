@@ -1899,6 +1899,7 @@ describe.sequential("agent permission routes", () => {
       "Cancelled by a board operator",
       expect.objectContaining({
         suppressImmediateRecovery: true,
+        suppressDeferredPromotion: true,
         resultJson: expect.objectContaining({ cancelledByActorType: "user" }),
       }),
     );
