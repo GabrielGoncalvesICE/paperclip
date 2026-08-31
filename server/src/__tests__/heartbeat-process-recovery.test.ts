@@ -5840,7 +5840,12 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
 
     runningProcesses.delete(runId);
-    const restartedHeartbeat = heartbeatService(db);
+    const restartedHeartbeat = heartbeatService(db, {
+      afterOperatorCancellationTerminationAcknowledged: async ({ runId: acknowledgedRunId }) => {
+        expect(acknowledgedRunId).toBe(runId);
+        throw new Error("simulated crash before issue release");
+      },
+    });
     await restartedHeartbeat.resumeQueuedRuns();
     expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
 
@@ -5870,9 +5875,26 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         model: "test-model",
       };
     });
-    expect((await restartedHeartbeat.reapOrphanedRuns()).runIds).toContain(runId);
+    await expect(restartedHeartbeat.reapOrphanedRuns()).rejects.toThrow(
+      "simulated crash before issue release",
+    );
+    expect(await restartedHeartbeat.getRun(runId)).toMatchObject({
+      resultJson: expect.objectContaining({
+        operatorCancellationTerminationPending: true,
+        operatorCancellationTerminationAcknowledged: true,
+      }),
+    });
+    expect(await db
+      .select({ executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]?.executionRunId)).toBe(runId);
+    expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+
+    const recoveredHeartbeat = heartbeatService(db);
+    expect((await recoveredHeartbeat.reapOrphanedRuns()).runIds).toContain(runId);
     await peerAdapterStartBarrier;
-    expect(((await restartedHeartbeat.getRun(runId))?.resultJson as Record<string, unknown> | null)
+    expect(((await recoveredHeartbeat.getRun(runId))?.resultJson as Record<string, unknown> | null)
       ?.operatorCancellationTerminationPending).toBeUndefined();
     expect(await db
       .select({ status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
@@ -5901,6 +5923,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .then((rows) => rows[0]?.count)).toBe(1);
     await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
     releasePeerAdapter?.();
+    await recoveredHeartbeat.drainActiveRunExecutions();
     await restartedHeartbeat.drainActiveRunExecutions();
     await heartbeat.drainActiveRunExecutions();
   });

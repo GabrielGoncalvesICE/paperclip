@@ -6925,6 +6925,10 @@ export interface HeartbeatServiceOptions {
     runId: string;
     issueId: string;
   }) => Promise<void>;
+  /** Test seam for a restart after process termination is acknowledged but before issue release. */
+  afterOperatorCancellationTerminationAcknowledged?: (input: {
+    runId: string;
+  }) => Promise<void>;
 }
 
 type WorkspaceReadyCommentWriter = {
@@ -14013,45 +14017,50 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           eq(heartbeatRuns.status, "cancelled"),
           sql`${heartbeatRuns.resultJson} ->> 'operatorCancellationTerminationPending' = 'true'`,
         ),
-      );
+    );
     for (const pendingRun of pendingOperatorCancellationTerminations) {
       const running = runningProcesses.get(pendingRun.id);
-      try {
-        if (running || pendingRun.processPid || pendingRun.processGroupId) {
-          await terminateHeartbeatRunProcess({
-            pid: running?.child.pid ?? pendingRun.processPid,
-            processGroupId: running?.processGroupId ?? pendingRun.processGroupId,
-            ...(running ? { graceMs: Math.max(1, running.graceSec) * 1000 } : {}),
-          });
+      let resultJson = parseObject(pendingRun.resultJson);
+      if (resultJson.operatorCancellationTerminationAcknowledged !== true) {
+        try {
+          if (running || pendingRun.processPid || pendingRun.processGroupId) {
+            await terminateHeartbeatRunProcess({
+              pid: running?.child.pid ?? pendingRun.processPid,
+              processGroupId: running?.processGroupId ?? pendingRun.processGroupId,
+              ...(running ? { graceMs: Math.max(1, running.graceSec) * 1000 } : {}),
+            });
+          }
+        } catch (err) {
+          logger.warn(
+            { err, runId: pendingRun.id },
+            "retry failed for causally cancelled process termination",
+          );
+          continue;
         }
-      } catch (err) {
-        logger.warn(
-          { err, runId: pendingRun.id },
-          "retry failed for causally cancelled process termination",
-        );
-        continue;
+
+        // Keep the pending marker discoverable until issue release commits. The
+        // acknowledged phase makes a restarted sweep idempotent without sending
+        // another signal to a PID that the OS may already have reused.
+        resultJson = {
+          ...resultJson,
+          operatorCancellationTerminationAcknowledged: true,
+        };
+        await db
+          .update(heartbeatRuns)
+          .set({ resultJson, updatedAt: now })
+          .where(eq(heartbeatRuns.id, pendingRun.id));
       }
 
-      const resultJson = parseObject(pendingRun.resultJson);
+      await options.afterOperatorCancellationTerminationAcknowledged?.({
+        runId: pendingRun.id,
+      });
+
       const suppressDeferredPromotion =
         resultJson.operatorCancellationSuppressDeferredPromotion === true;
-      delete resultJson.operatorCancellationTerminationPending;
-      delete resultJson.operatorCancellationSuppressDeferredPromotion;
-      const cleanedRun = await db
-        .update(heartbeatRuns)
-        .set({ resultJson, updatedAt: now })
-        .where(eq(heartbeatRuns.id, pendingRun.id))
-        .returning()
-        .then((rows) => rows[0] ?? pendingRun);
       runningProcesses.delete(pendingRun.id);
       clearHeartbeatRunRuntimeStatus(pendingRun.id);
-      publishLiveEvent({
-        companyId: cleanedRun.companyId,
-        type: "heartbeat.run.status",
-        payload: buildHeartbeatRunStatusLiveEventPayload(cleanedRun),
-      });
-      publishRunLifecyclePluginEvent(cleanedRun);
-      await releaseIssueExecutionAndPromote(cleanedRun, {
+      const acknowledgedRun = { ...pendingRun, resultJson };
+      await releaseIssueExecutionAndPromote(acknowledgedRun, {
         suppressImmediateRecovery: true,
         suppressDeferredPromotion,
         promoteOtherAgentsAfterDeferredSuppression: suppressDeferredPromotion,
@@ -14059,6 +14068,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ? pendingRun.id
           : undefined,
       });
+      delete resultJson.operatorCancellationTerminationPending;
+      delete resultJson.operatorCancellationTerminationAcknowledged;
+      delete resultJson.operatorCancellationSuppressDeferredPromotion;
+      const cleanedRun = await db
+        .update(heartbeatRuns)
+        .set({ resultJson, updatedAt: now })
+        .where(eq(heartbeatRuns.id, pendingRun.id))
+        .returning()
+        .then((rows) => rows[0] ?? acknowledgedRun);
+      publishLiveEvent({
+        companyId: cleanedRun.companyId,
+        type: "heartbeat.run.status",
+        payload: buildHeartbeatRunStatusLiveEventPayload(cleanedRun),
+      });
+      publishRunLifecyclePluginEvent(cleanedRun);
       await finalizeAgentStatus(cleanedRun.agentId, "cancelled");
       await startNextQueuedRunForAgent(cleanedRun.agentId);
       reaped.push(cleanedRun.id);
@@ -19042,7 +19066,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             .where(eq(heartbeatRuns.id, issue.executionRunId))
             .then((rows) => rows[0] ?? null)
           : null;
-        const activeExecutionCleanupPending = Boolean(
+        let activeExecutionCleanupPending = Boolean(
           parseObject(activeExecutionRun?.resultJson).operatorCancellationTerminationPending,
         );
 
@@ -19124,6 +19148,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               updatedAt: new Date(),
             })
             .where(eq(issues.id, issue.id));
+        }
+
+        if (!activeExecutionRun) {
+          activeExecutionRun = await tx
+            .select()
+            .from(heartbeatRuns)
+            .where(and(
+              eq(heartbeatRuns.companyId, issue.companyId),
+              eq(heartbeatRuns.status, "cancelled"),
+              sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
+              sql`${heartbeatRuns.resultJson} ->> 'operatorCancellationTerminationPending' = 'true'`,
+            ))
+            .orderBy(asc(heartbeatRuns.createdAt))
+            .limit(1)
+            .then((rows) => rows[0] ?? null);
+          activeExecutionCleanupPending = Boolean(activeExecutionRun);
         }
 
         if (!activeExecutionRun) {
@@ -20078,7 +20118,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // enter the same issue while the old adapter may still be executing.
       const cancelledRunIds = [
         ...(!targetTerminationPending ? [updated.id] : []),
-        ...successorRuns.map((successorRun) => successorRun.id),
+        ...successorRuns
+          .filter((successorRun) =>
+            parseObject(successorRun.resultJson).operatorCancellationTerminationPending !== true,
+          )
+          .map((successorRun) => successorRun.id),
       ];
       if (cancelledRunIds.length > 0) {
         await tx
@@ -20124,8 +20168,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       } finally {
         if (!terminationFailed) {
           const resultJson = parseObject(successorRun.resultJson);
-          delete resultJson.operatorCancellationTerminationPending;
-          delete resultJson.operatorCancellationSuppressDeferredPromotion;
+          if (resultJson.operatorCancellationTerminationPending === true) {
+            resultJson.operatorCancellationTerminationAcknowledged = true;
+          }
           const terminatedRun = await db
             .update(heartbeatRuns)
             .set({ resultJson, updatedAt: new Date() })
@@ -20221,8 +20266,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     if (cancelled && targetHasPendingCleanup && !targetTerminationFailed) {
       const cleanedResultJson = parseObject(cancelled.resultJson);
-      delete cleanedResultJson.operatorCancellationTerminationPending;
-      delete cleanedResultJson.operatorCancellationSuppressDeferredPromotion;
+      cleanedResultJson.operatorCancellationTerminationAcknowledged = true;
       cancelled = await db
         .update(heartbeatRuns)
         .set({ resultJson: cleanedResultJson, updatedAt: new Date() })
