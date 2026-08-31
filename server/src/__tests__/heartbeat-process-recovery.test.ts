@@ -4470,12 +4470,26 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
-  it("does not create a successor for an explicitly suppressed issue-bound cancellation", async () => {
-    const { companyId, runId } = await seedRunFixture({
+  it("does not promote deferred work or create a successor for a suppressed issue-bound cancellation", async () => {
+    const { companyId, agentId, issueId, runId } = await seedRunFixture({
       agentStatus: "running",
       includeIssue: true,
     });
     const heartbeat = heartbeatService(db);
+    const deferredWakeupId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: deferredWakeupId,
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_execution_deferred",
+      payload: {
+        issueId,
+        _paperclipWakeContext: { issueId, wakeReason: "issue_assigned" },
+      },
+      status: "deferred_issue_execution",
+    });
 
     await heartbeat.cancelRun(runId, "Cancelled by a board operator", {
       suppressImmediateRecovery: true,
@@ -4487,6 +4501,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .from(heartbeatRuns)
       .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.retryOfRunId, runId)));
     expect(successors).toHaveLength(0);
+
+    const deferredWakeup = await db
+      .select({ status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, deferredWakeupId))
+      .then((rows) => rows[0]);
+    expect(deferredWakeup).toEqual({ status: "cancelled", runId: null });
   });
 
   it("dispatches assigned todo work with no prior run as a normal assignment wake", async () => {
