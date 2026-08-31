@@ -20015,6 +20015,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     suppressDeferredPromotion?: boolean;
   };
 
+  async function clearOperatorCancellationCleanupMarkers(
+    run: typeof heartbeatRuns.$inferSelect,
+  ) {
+    const resultJson = parseObject(run.resultJson);
+    delete resultJson.operatorCancellationTerminationPending;
+    delete resultJson.operatorCancellationTerminationAcknowledged;
+    delete resultJson.operatorCancellationSuppressDeferredPromotion;
+    return db
+      .update(heartbeatRuns)
+      .set({ resultJson, updatedAt: new Date() })
+      .where(eq(heartbeatRuns.id, run.id))
+      .returning()
+      .then((rows) => rows[0] ?? { ...run, resultJson });
+  }
+
   async function cancelRunAndQueuedRunsForIssue(
     run: typeof heartbeatRuns.$inferSelect,
     issueId: string,
@@ -20147,6 +20162,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const cancelled = cancellation?.updated ?? null;
 
     let successorTerminationFailed = false;
+    const successfullyTerminatedSuccessors: Array<typeof heartbeatRuns.$inferSelect> = [];
     for (const successorRun of cancellation?.successorRuns ?? []) {
       const running = runningProcesses.get(successorRun.id);
       let terminationFailed = false;
@@ -20177,6 +20193,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             .where(eq(heartbeatRuns.id, successorRun.id))
             .returning()
             .then((rows) => rows[0] ?? successorRun);
+          successfullyTerminatedSuccessors.push(terminatedRun);
           runningProcesses.delete(successorRun.id);
           clearHeartbeatRunRuntimeStatus(successorRun.id);
           publishLiveEvent({
@@ -20198,7 +20215,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
       publishRunLifecyclePluginEvent(cancelled);
     }
-    return { cancelled, successorTerminationFailed };
+    return { cancelled, successorTerminationFailed, successfullyTerminatedSuccessors };
   }
 
   async function cancelRunInternal(runId: string, reason = "Cancelled by control plane", options: CancelRunOptions = {}) {
@@ -20231,6 +20248,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       : null;
     let cancelled = issueCancellation?.cancelled ?? null;
     const successorTerminationFailed = issueCancellation?.successorTerminationFailed ?? false;
+    const successfullyTerminatedSuccessors =
+      issueCancellation?.successfullyTerminatedSuccessors ?? [];
     if (issueCancellation && !cancelled) {
       return (await getRun(runId)) ?? run;
     }
@@ -20297,6 +20316,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           suppressImmediateRecovery: options.suppressImmediateRecovery,
           suppressDeferredPromotion: options.suppressDeferredPromotion,
         });
+        if (targetHasPendingCleanup) {
+          cancelled = await clearOperatorCancellationCleanupMarkers(cancelled);
+        }
+        for (const successorRun of successfullyTerminatedSuccessors) {
+          await releaseIssueExecutionAndPromote(successorRun, {
+            suppressImmediateRecovery: true,
+            suppressDeferredPromotion: true,
+          });
+          await clearOperatorCancellationCleanupMarkers(successorRun);
+        }
       }
     }
 
