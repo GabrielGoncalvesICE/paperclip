@@ -5088,7 +5088,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         triggerDetail: "system",
         status: "queued",
         wakeupRequestId: queuedSameIssueWakeupId,
-        contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+        contextSnapshot: { issueId, wakeReason: "issue_assigned", queuedAsFollowupToRunId: runId },
       },
       {
         id: unrelatedRunId,
@@ -5184,6 +5184,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     const successorWakeupId = randomUUID();
     const successorRunId = randomUUID();
+    const independentQueuedWakeupId = randomUUID();
+    const independentQueuedRunId = randomUUID();
     await db.insert(agentWakeupRequests).values({
       id: successorWakeupId,
       companyId,
@@ -5206,6 +5208,27 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       contextSnapshot: { issueId, wakeReason: "issue_assigned" },
       startedAt: new Date(),
     });
+    await db.insert(agentWakeupRequests).values({
+      id: independentQueuedWakeupId,
+      companyId,
+      agentId,
+      source: "on_demand",
+      triggerDetail: "manual",
+      reason: "independent_work",
+      payload: { issueId },
+      status: "queued",
+      runId: independentQueuedRunId,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: independentQueuedRunId,
+      companyId,
+      agentId,
+      invocationSource: "on_demand",
+      triggerDetail: "manual",
+      status: "queued",
+      wakeupRequestId: independentQueuedWakeupId,
+      contextSnapshot: { issueId, wakeReason: "manual" },
+    });
 
     const heartbeat = heartbeatService(db);
     await heartbeat.cancelRun(runId, "Cancelled by a board operator", {
@@ -5220,7 +5243,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       status: "running",
       errorCode: null,
     });
-    expect(mockAdapterExecute).not.toHaveBeenCalled();
+    const independentQueued = await heartbeat.getRun(independentQueuedRunId);
+    expect(independentQueued?.errorCode).not.toBe("operator_cancelled_issue_run");
   });
 
   it("dispatches assigned todo work with no prior run as a normal assignment wake", async () => {
