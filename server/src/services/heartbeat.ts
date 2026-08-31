@@ -18925,6 +18925,44 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     suppressDeferredPromotion?: boolean;
   };
 
+  async function cancelQueuedRunsForIssue(run: typeof heartbeatRuns.$inferSelect, issueId: string) {
+    const queuedRuns = await db
+      .update(heartbeatRuns)
+      .set({
+        status: "cancelled",
+        finishedAt: new Date(),
+        error: "Queued issue wake suppressed by operator cancellation",
+        errorCode: "operator_cancelled_issue_run",
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, run.companyId),
+          eq(heartbeatRuns.agentId, run.agentId),
+          eq(heartbeatRuns.status, "queued"),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+          sql`${heartbeatRuns.id} <> ${run.id}`,
+        ),
+      )
+      .returning({ wakeupRequestId: heartbeatRuns.wakeupRequestId });
+
+    const wakeupRequestIds = queuedRuns
+      .map((queuedRun) => queuedRun.wakeupRequestId)
+      .filter((wakeupRequestId): wakeupRequestId is string => Boolean(wakeupRequestId));
+    if (wakeupRequestIds.length === 0) return;
+
+    const now = new Date();
+    await db
+      .update(agentWakeupRequests)
+      .set({
+        status: "cancelled",
+        finishedAt: now,
+        error: "Queued issue wake suppressed by operator cancellation",
+        updatedAt: now,
+      })
+      .where(inArray(agentWakeupRequests.id, wakeupRequestIds));
+  }
+
   async function cancelRunInternal(runId: string, reason = "Cancelled by control plane", options: CancelRunOptions = {}) {
     const run = await getRun(runId);
     if (!run) throw notFound("Heartbeat run not found");
@@ -18985,6 +19023,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         suppressImmediateRecovery: options.suppressImmediateRecovery,
         suppressDeferredPromotion: options.suppressDeferredPromotion,
       });
+      const issueId = readNonEmptyString(parseObject(cancelled.contextSnapshot).issueId);
+      if (options.suppressDeferredPromotion && issueId) {
+        await cancelQueuedRunsForIssue(cancelled, issueId);
+      }
     }
 
     await finalizeAgentStatus(run.agentId, "cancelled", undefined, {
