@@ -17776,6 +17776,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`,
             ),
           );
+
+        // Exact-run operator cancellation suppresses this agent's deferred
+        // continuation; it must not then promote another agent's wake for the
+        // same issue as a side effect of releasing the cancelled run.
+        return null;
       }
 
       while (true) {
@@ -19860,27 +19865,57 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .where(inArray(agentWakeupRequests.id, wakeupRequestIds));
       }
 
+      const successorRunIds = successorRuns.map((successorRun) => successorRun.id);
+      if (successorRunIds.length > 0) {
+        await tx
+          .update(issues)
+          .set({
+            executionRunId: null,
+            executionAgentNameKey: null,
+            executionLockedAt: null,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(issues.id, issueId),
+              eq(issues.companyId, run.companyId),
+              inArray(issues.executionRunId, successorRunIds),
+            ),
+          );
+      }
+
       return { updated, successorRuns };
     });
     const cancelled = cancellation?.updated ?? null;
 
     for (const successorRun of cancellation?.successorRuns ?? []) {
       const running = runningProcesses.get(successorRun.id);
-      if (running || successorRun.processPid || successorRun.processGroupId) {
-        await terminateHeartbeatRunProcess({
-          pid: running?.child.pid ?? successorRun.processPid,
-          processGroupId: running?.processGroupId ?? successorRun.processGroupId,
-          ...(running ? { graceMs: Math.max(1, running.graceSec) * 1000 } : {}),
+      try {
+        if (running || successorRun.processPid || successorRun.processGroupId) {
+          await terminateHeartbeatRunProcess({
+            pid: running?.child.pid ?? successorRun.processPid,
+            processGroupId: running?.processGroupId ?? successorRun.processGroupId,
+            ...(running ? { graceMs: Math.max(1, running.graceSec) * 1000 } : {}),
+          });
+        }
+      } catch (err) {
+        // The database transaction already made the run and wake terminal and
+        // cleared any execution lock. Process cleanup is best-effort from here:
+        // a local supervisor failure must not make cancellation unretryable.
+        logger.warn(
+          { err, runId: successorRun.id },
+          "failed to terminate causally linked run after operator cancellation",
+        );
+      } finally {
+        runningProcesses.delete(successorRun.id);
+        clearHeartbeatRunRuntimeStatus(successorRun.id);
+        publishLiveEvent({
+          companyId: successorRun.companyId,
+          type: "heartbeat.run.status",
+          payload: buildHeartbeatRunStatusLiveEventPayload(successorRun),
         });
+        publishRunLifecyclePluginEvent(successorRun);
       }
-      runningProcesses.delete(successorRun.id);
-      clearHeartbeatRunRuntimeStatus(successorRun.id);
-      publishLiveEvent({
-        companyId: successorRun.companyId,
-        type: "heartbeat.run.status",
-        payload: buildHeartbeatRunStatusLiveEventPayload(successorRun),
-      });
-      publishRunLifecyclePluginEvent(successorRun);
     }
 
     if (cancelled) {
