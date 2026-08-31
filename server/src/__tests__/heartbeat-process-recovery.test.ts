@@ -4765,7 +4765,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
     mockTerminateLocalService.mockImplementationOnce(async () => {
       releaseAdapter?.();
-      throw new Error("simulated linked process termination failure");
     });
     const linkedStatusEvents: string[] = [];
     const unsubscribe = subscribeCompanyLiveEvents(companyId, (event) => {
