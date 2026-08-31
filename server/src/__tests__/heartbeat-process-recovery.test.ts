@@ -4572,6 +4572,29 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       },
     ]);
 
+    let unrelatedAdapterStarted: (() => void) | null = null;
+    const unrelatedAdapterStartBarrier = new Promise<void>((resolve) => {
+      unrelatedAdapterStarted = resolve;
+    });
+    let releaseUnrelatedAdapter: (() => void) | null = null;
+    const unrelatedAdapterReleaseBarrier = new Promise<void>((resolve) => {
+      releaseUnrelatedAdapter = resolve;
+    });
+    mockAdapterExecute.mockImplementationOnce(async (ctx: { runId: string }) => {
+      expect(ctx.runId).toBe(unrelatedRunId);
+      unrelatedAdapterStarted?.();
+      await unrelatedAdapterReleaseBarrier;
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Independent issue work completed.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
     const siblingStatusEvents: string[] = [];
     const unsubscribe = subscribeCompanyLiveEvents(companyId, (event) => {
       const payload = event.payload as { runId?: string; status?: string };
@@ -4616,25 +4639,32 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await holdTargetRunLock;
     await cancellation;
     await competingClaim;
-    await heartbeat.drainActiveRunExecutions();
+    await unrelatedAdapterStartBarrier;
 
     unsubscribe();
 
-    const causalSuccessorRuns = await db
-      .select({ id: heartbeatRuns.id, status: heartbeatRuns.status, startedAt: heartbeatRuns.startedAt })
+    const issueRuns = await db
+      .select({
+        id: heartbeatRuns.id,
+        status: heartbeatRuns.status,
+        startedAt: heartbeatRuns.startedAt,
+      })
       .from(heartbeatRuns)
       .where(
         and(
           eq(heartbeatRuns.companyId, companyId),
-          eq(heartbeatRuns.agentId, agentId),
           sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
-          sql`${heartbeatRuns.contextSnapshot} ->> 'queuedAsFollowupToRunId' = ${runId}`,
           sql`${heartbeatRuns.id} <> ${runId}`,
         ),
-      );
-    expect(causalSuccessorRuns).toEqual([
+      )
+      .orderBy(heartbeatRuns.id);
+    expect(issueRuns.filter((candidate) =>
+      candidate.id !== queuedSameIssueRunId && candidate.id !== unrelatedRunId
+    )).toEqual([]);
+    expect(issueRuns).toEqual(expect.arrayContaining([
       expect.objectContaining({ id: queuedSameIssueRunId, status: "cancelled", startedAt: null }),
-    ]);
+      expect.objectContaining({ id: unrelatedRunId, status: "running" }),
+    ]));
 
     const deferredWakeup = await db
       .select({ status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
@@ -4648,7 +4678,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.id, peerDeferredWakeupId))
       .then((rows) => rows[0]);
-    expect(peerDeferredWakeup?.error).not.toBe("Deferred wake suppressed by terminal run release");
+    expect(peerDeferredWakeup).toEqual({ status: "deferred_issue_execution", error: null });
 
     const queuedSameIssueWakeup = await db
       .select({ status: agentWakeupRequests.status })
@@ -4666,8 +4696,127 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(JSON.stringify(mockAdapterExecute.mock.calls)).not.toContain(queuedSameIssueRunId);
     expect(siblingStatusEvents.at(-1)).toBe("cancelled");
 
+    releaseUnrelatedAdapter?.();
     const unrelatedRun = await waitForRunToSettle(heartbeat, unrelatedRunId);
     expect(unrelatedRun?.status).toBe("succeeded");
+    await heartbeat.drainActiveRunExecutions();
+  });
+
+  it("terminalizes a causally linked run claimed before operator cancellation", async () => {
+    const { companyId, agentId, issueId, runId } = await seedRunFixture({
+      agentStatus: "running",
+      includeIssue: true,
+    });
+    await db
+      .update(agents)
+      .set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 2 } } })
+      .where(eq(agents.id, agentId));
+
+    const linkedWakeupId = randomUUID();
+    const linkedRunId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: linkedWakeupId,
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId },
+      status: "queued",
+      runId: linkedRunId,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: linkedRunId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "queued",
+      wakeupRequestId: linkedWakeupId,
+      contextSnapshot: { issueId, wakeReason: "issue_assigned", queuedAsFollowupToRunId: runId },
+    });
+
+    let adapterStarted: (() => void) | null = null;
+    const adapterStartBarrier = new Promise<void>((resolve) => {
+      adapterStarted = resolve;
+    });
+    let releaseAdapter: (() => void) | null = null;
+    const adapterReleaseBarrier = new Promise<void>((resolve) => {
+      releaseAdapter = resolve;
+    });
+    mockAdapterExecute.mockImplementationOnce(async (ctx: { runId: string }) => {
+      expect(ctx.runId).toBe(linkedRunId);
+      runningProcesses.set(linkedRunId, {
+        child: { pid: 12345 } as ChildProcess,
+        graceSec: 1,
+        processGroupId: null,
+      });
+      adapterStarted?.();
+      await adapterReleaseBarrier;
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Linked adapter stopped after cancellation.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+    mockTerminateLocalService.mockImplementationOnce(async () => {
+      releaseAdapter?.();
+      throw new Error("simulated linked process termination failure");
+    });
+
+    const linkedStatusEvents: string[] = [];
+    const unsubscribe = subscribeCompanyLiveEvents(companyId, (event) => {
+      const payload = event.payload as { runId?: string; status?: string };
+      if (event.type === "heartbeat.run.status" && payload.runId === linkedRunId && payload.status) {
+        linkedStatusEvents.push(payload.status);
+      }
+    });
+
+    const heartbeat = heartbeatService(db);
+    await heartbeat.resumeQueuedRuns();
+    await adapterStartBarrier;
+
+    const claimedRun = await heartbeat.getRun(linkedRunId);
+    expect(claimedRun).toMatchObject({ status: "running" });
+    expect(claimedRun?.startedAt).not.toBeNull();
+
+    await expect(heartbeat.cancelRun(runId, "Cancelled by a board operator", {
+      suppressImmediateRecovery: true,
+      suppressDeferredPromotion: true,
+      resultJson: { cancelledByActorType: "user" },
+    })).resolves.toMatchObject({ id: runId, status: "cancelled" });
+    const linkedAdapterCallsAtCancellation = mockAdapterExecute.mock.calls
+      .filter(([ctx]) => ctx?.runId === linkedRunId).length;
+    await heartbeat.drainActiveRunExecutions();
+    unsubscribe();
+
+    const linkedRun = await heartbeat.getRun(linkedRunId);
+    expect(linkedRun).toMatchObject({
+      status: "cancelled",
+      errorCode: "operator_cancelled_issue_run",
+    });
+    const linkedWakeup = await db
+      .select({ status: agentWakeupRequests.status })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, linkedWakeupId))
+      .then((rows) => rows[0]);
+    expect(linkedWakeup?.status).toBe("cancelled");
+    const issue = await db
+      .select({ executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(issue?.executionRunId).toBeNull();
+    expect(mockTerminateLocalService).toHaveBeenCalledTimes(1);
+    expect(runningProcesses.has(linkedRunId)).toBe(false);
+    expect(linkedAdapterCallsAtCancellation).toBe(1);
+    expect(mockAdapterExecute.mock.calls.filter(([ctx]) => ctx?.runId === linkedRunId))
+      .toHaveLength(linkedAdapterCallsAtCancellation);
+    expect(linkedStatusEvents.at(-1)).toBe("cancelled");
   });
 
   it("preserves an independent issue run claimed before operator cancellation acquires the issue lock", async () => {
