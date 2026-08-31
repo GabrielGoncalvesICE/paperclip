@@ -16099,7 +16099,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (managedMcpConfig) {
           adapterContext.paperclipManagedMcp = managedMcpConfig;
         }
-        adapterResult = await adapter.execute({
+        const executeAdapter = () => adapter.execute({
           runId: run.id,
           agent,
           runtime: runtimeForAdapter,
@@ -16134,6 +16134,44 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           },
           authToken: authToken ?? undefined,
         });
+        const queuedAsFollowupToRunId = readNonEmptyString(context.queuedAsFollowupToRunId);
+        if (issueId && queuedAsFollowupToRunId) {
+          const guardedDispatch = await db.transaction(async (tx) => {
+            await tx
+              .select({ id: issues.id })
+              .from(issues)
+              .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
+              .for("update");
+            const currentRun = await tx
+              .select({ status: heartbeatRuns.status })
+              .from(heartbeatRuns)
+              .where(eq(heartbeatRuns.id, run.id))
+              .then((rows) => rows[0] ?? null);
+            if (currentRun?.status !== "running") {
+              await tx
+                .update(issues)
+                .set({
+                  executionRunId: null,
+                  executionAgentNameKey: null,
+                  executionLockedAt: null,
+                  updatedAt: new Date(),
+                })
+                .where(
+                  and(
+                    eq(issues.id, issueId),
+                    eq(issues.companyId, run.companyId),
+                    eq(issues.executionRunId, run.id),
+                  ),
+                );
+              return { dispatched: false as const };
+            }
+            return { dispatched: true as const, resultPromise: executeAdapter() };
+          });
+          if (!guardedDispatch.dispatched) return;
+          adapterResult = await guardedDispatch.resultPromise;
+        } else {
+          adapterResult = await executeAdapter();
+        }
         // Adapter returned cleanly, which means its workspace-restore finally
         // block also ran without throwing. Record the workspace_finalize
         // barrier so dependents that share this executionWorkspace can wake.
@@ -16402,6 +16440,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           },
           "skipping late run finalization because the run already left running state",
         );
+        if (
+          persistedRunWrite.run?.status === "cancelled" &&
+          persistedRunWrite.run.errorCode === "operator_cancelled_issue_run"
+        ) {
+          await db
+            .update(issues)
+            .set({
+              executionRunId: null,
+              executionAgentNameKey: null,
+              executionLockedAt: null,
+              updatedAt: new Date(),
+            })
+            .where(
+              and(
+                eq(issues.companyId, run.companyId),
+                eq(issues.executionRunId, run.id),
+              ),
+            );
+        }
         return;
       }
 

@@ -4736,36 +4736,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       contextSnapshot: { issueId, wakeReason: "issue_assigned", queuedAsFollowupToRunId: runId },
     });
 
-    let adapterStarted: (() => void) | null = null;
-    const adapterStartBarrier = new Promise<void>((resolve) => {
-      adapterStarted = resolve;
-    });
-    let releaseAdapter: (() => void) | null = null;
-    const adapterReleaseBarrier = new Promise<void>((resolve) => {
-      releaseAdapter = resolve;
-    });
-    mockAdapterExecute.mockImplementationOnce(async (ctx: { runId: string }) => {
-      expect(ctx.runId).toBe(linkedRunId);
-      runningProcesses.set(linkedRunId, {
-        child: { pid: 12345 } as ChildProcess,
-        graceSec: 1,
-        processGroupId: null,
-      });
-      adapterStarted?.();
-      await adapterReleaseBarrier;
-      return {
-        exitCode: 0,
-        signal: null,
-        timedOut: false,
-        errorMessage: null,
-        summary: "Linked adapter stopped after cancellation.",
-        provider: "test",
-        model: "test-model",
-      };
-    });
-    mockTerminateLocalService.mockImplementationOnce(async () => {
-      releaseAdapter?.();
-    });
+    mockTerminateLocalService.mockResolvedValueOnce(undefined);
     const linkedStatusEvents: string[] = [];
     const unsubscribe = subscribeCompanyLiveEvents(companyId, (event) => {
       const payload = event.payload as { runId?: string; status?: string };
@@ -4775,20 +4746,72 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
 
     const heartbeat = heartbeatService(db);
-    await heartbeat.resumeQueuedRuns();
-    await adapterStartBarrier;
+    let releaseLinkedRunLock: (() => void) | null = null;
+    let linkedRunLocked: (() => void) | null = null;
+    const linkedRunLockAcquired = new Promise<void>((resolve) => {
+      linkedRunLocked = resolve;
+    });
+    const holdLinkedRunLock = db.transaction(async (tx) => {
+      await tx.execute(sql`select id from heartbeat_runs where id = ${linkedRunId} for update`);
+      linkedRunLocked?.();
+      await new Promise<void>((resolve) => {
+        releaseLinkedRunLock = resolve;
+      });
+    });
+    let releaseTargetRunLock: (() => void) | null = null;
+    let targetRunLocked: (() => void) | null = null;
+    const targetRunLockAcquired = new Promise<void>((resolve) => {
+      targetRunLocked = resolve;
+    });
+    const holdTargetRunLock = db.transaction(async (tx) => {
+      await tx.execute(sql`select id from heartbeat_runs where id = ${runId} for update`);
+      targetRunLocked?.();
+      await new Promise<void>((resolve) => {
+        releaseTargetRunLock = resolve;
+      });
+    });
+    await Promise.all([linkedRunLockAcquired, targetRunLockAcquired]);
+
+    const competingClaim = heartbeat.resumeQueuedRuns();
+    await waitForValue(async () => {
+      try {
+        await db.transaction((tx) =>
+          tx.execute(sql`select id from issues where id = ${issueId} for update nowait`)
+        );
+        return null;
+      } catch {
+        return true;
+      }
+    });
+    const cancellation = heartbeat.cancelRun(runId, "Cancelled by a board operator", {
+      suppressImmediateRecovery: true,
+      suppressDeferredPromotion: true,
+      resultJson: { cancelledByActorType: "user" },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    releaseLinkedRunLock?.();
+    await holdLinkedRunLock;
+    await competingClaim;
 
     const claimedRun = await heartbeat.getRun(linkedRunId);
     expect(claimedRun).toMatchObject({ status: "running" });
     expect(claimedRun?.startedAt).not.toBeNull();
+    const claimedWakeup = await db
+      .select({ status: agentWakeupRequests.status })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, linkedWakeupId))
+      .then((rows) => rows[0]);
+    expect(claimedWakeup?.status).toBe("claimed");
+    runningProcesses.set(linkedRunId, {
+      child: { pid: 12345 } as ChildProcess,
+      graceSec: 1,
+      processGroupId: null,
+    });
 
-    await expect(heartbeat.cancelRun(runId, "Cancelled by a board operator", {
-      suppressImmediateRecovery: true,
-      suppressDeferredPromotion: true,
-      resultJson: { cancelledByActorType: "user" },
-    })).resolves.toMatchObject({ id: runId, status: "cancelled" });
-    const linkedAdapterCallsAtCancellation = mockAdapterExecute.mock.calls
-      .filter(([ctx]) => ctx?.runId === linkedRunId).length;
+    releaseTargetRunLock?.();
+    await holdTargetRunLock;
+    await expect(cancellation).resolves.toMatchObject({ id: runId, status: "cancelled" });
     await heartbeat.drainActiveRunExecutions();
     unsubscribe();
 
@@ -4811,9 +4834,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(issue?.executionRunId).toBeNull();
     expect(mockTerminateLocalService).toHaveBeenCalledTimes(1);
     expect(runningProcesses.has(linkedRunId)).toBe(false);
-    expect(linkedAdapterCallsAtCancellation).toBe(1);
-    expect(mockAdapterExecute.mock.calls.filter(([ctx]) => ctx?.runId === linkedRunId))
-      .toHaveLength(linkedAdapterCallsAtCancellation);
+    expect(mockAdapterExecute.mock.calls.filter(([ctx]) => ctx?.runId === linkedRunId)).toHaveLength(0);
     expect(linkedStatusEvents.at(-1)).toBe("cancelled");
   });
 
