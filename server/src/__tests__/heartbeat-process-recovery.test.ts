@@ -5374,7 +5374,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(linkedStatusEvents.at(-1)).toBe("cancelled");
   });
 
-  it("quarantines dispatch while a causally cancelled adapter survives failed termination", async () => {
+  it("persists cancellation quarantine before termination and reaps it after service map loss", async () => {
     const { companyId, agentId, issueId, runId } = await seedRunFixture({
       agentStatus: "running",
       includeIssue: true,
@@ -5463,42 +5463,65 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         model: "test-model",
       };
     });
-    mockTerminateLocalService.mockRejectedValueOnce(new Error("simulated live process termination failure"));
+    let terminationStarted: (() => void) | null = null;
+    const terminationStartBarrier = new Promise<void>((resolve) => {
+      terminationStarted = resolve;
+    });
+    let rejectTermination: (() => void) | null = null;
+    const terminationFailureBarrier = new Promise<void>((resolve) => {
+      rejectTermination = resolve;
+    });
+    mockTerminateLocalService.mockImplementationOnce(async () => {
+      terminationStarted?.();
+      await terminationFailureBarrier;
+      throw new Error("simulated live process termination failure");
+    });
 
     const heartbeat = heartbeatService(db);
     await heartbeat.resumeQueuedRuns();
     await adapterStartBarrier;
-    await expect(heartbeat.cancelRun(runId, "Cancelled by a board operator", {
+    const cancellation = heartbeat.cancelRun(runId, "Cancelled by a board operator", {
       suppressImmediateRecovery: true,
       suppressDeferredPromotion: true,
       resultJson: { cancelledByActorType: "user" },
-    })).resolves.toMatchObject({ id: runId, status: "cancelled" });
+    });
+    await terminationStartBarrier;
 
+    // The durable marker and process identity commit before external termination settles.
     expect(runningProcesses.has(linkedRunId)).toBe(true);
     expect(await heartbeat.getRun(linkedRunId)).toMatchObject({
       status: "cancelled",
+      processPid: 12345,
       resultJson: expect.objectContaining({ operatorCancellationTerminationPending: true }),
     });
     expect((await heartbeat.getRun(nextRunId))?.status).toBe("queued");
     expect(mockAdapterExecute.mock.calls.filter(([ctx]) => ctx?.runId === linkedRunId)).toHaveLength(1);
     expect(mockAdapterExecute.mock.calls.filter(([ctx]) => ctx?.runId === nextRunId)).toHaveLength(0);
 
-    await heartbeat.resumeQueuedRuns();
+    // Simulate a service restart losing its in-memory process map. The persisted marker
+    // must still quarantine dispatch until a fresh service instance reaps the process.
+    runningProcesses.delete(linkedRunId);
+    const restartedHeartbeat = heartbeatService(db);
+    await restartedHeartbeat.resumeQueuedRuns();
     expect((await heartbeat.getRun(nextRunId))?.status).toBe("queued");
-    expect(runningProcesses.has(linkedRunId)).toBe(true);
+
+    rejectTermination?.();
+    await expect(cancellation).resolves.toMatchObject({ id: runId, status: "cancelled" });
 
     mockTerminateLocalService.mockImplementationOnce(async () => {
       releaseAdapter?.();
     });
-    const reapResult = await heartbeat.reapOrphanedRuns();
+    const reapResult = await restartedHeartbeat.reapOrphanedRuns();
     expect(reapResult.runIds).toContain(linkedRunId);
+    await restartedHeartbeat.drainActiveRunExecutions();
     await heartbeat.drainActiveRunExecutions();
     expect(runningProcesses.has(linkedRunId)).toBe(false);
     expect(((await heartbeat.getRun(linkedRunId))?.resultJson as Record<string, unknown> | null)
       ?.operatorCancellationTerminationPending).toBeUndefined();
 
-    const nextRun = await waitForRunToSettle(heartbeat, nextRunId);
-    expect(nextRun?.status).toBe("succeeded");
+    await waitForRunToSettle(heartbeat, nextRunId);
+    expect((await heartbeat.getRun(nextRunId))?.status).not.toBe("queued");
+    expect(mockAdapterExecute.mock.calls.filter(([ctx]) => ctx?.runId === nextRunId)).toHaveLength(1);
   });
 
   it("preserves an independent issue run claimed before operator cancellation acquires the issue lock", async () => {

@@ -19962,15 +19962,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .then((rows) => rows[0] ?? null);
       if (!updated) return null;
 
-      const successorRuns = await tx
-        .update(heartbeatRuns)
-        .set({
-          status: "cancelled",
-          finishedAt: now,
-          error: "Queued issue wake suppressed by operator cancellation",
-          errorCode: "operator_cancelled_issue_run",
-          updatedAt: now,
-        })
+      const successorCandidates = await tx
+        .select()
+        .from(heartbeatRuns)
         .where(
           and(
             eq(heartbeatRuns.companyId, run.companyId),
@@ -19979,8 +19973,35 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             sql`${heartbeatRuns.contextSnapshot} ->> 'queuedAsFollowupToRunId' = ${run.id}`,
             sql`${heartbeatRuns.id} <> ${run.id}`,
           ),
-        )
-        .returning();
+        );
+      const successorRuns = [];
+      for (const successorRun of successorCandidates) {
+        const running = runningProcesses.get(successorRun.id);
+        const processPid = running?.child.pid ?? successorRun.processPid;
+        const processGroupId = running?.processGroupId ?? successorRun.processGroupId;
+        const terminationPending = successorRun.status === "running" && Boolean(processPid || processGroupId);
+        const updatedSuccessor = await tx
+          .update(heartbeatRuns)
+          .set({
+            status: "cancelled",
+            finishedAt: now,
+            error: "Queued issue wake suppressed by operator cancellation",
+            errorCode: "operator_cancelled_issue_run",
+            ...(terminationPending ? {
+              processPid,
+              processGroupId,
+              resultJson: {
+                ...parseObject(successorRun.resultJson),
+                operatorCancellationTerminationPending: true,
+              },
+            } : {}),
+            updatedAt: now,
+          })
+          .where(eq(heartbeatRuns.id, successorRun.id))
+          .returning()
+          .then((rows) => rows[0]);
+        if (updatedSuccessor) successorRuns.push(updatedSuccessor);
+      }
 
       const wakeupRequestIds = successorRuns
         .map((successorRun) => successorRun.wakeupRequestId)
@@ -20035,30 +20056,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       } catch (err) {
         terminationFailed = true;
         successorTerminationFailed = true;
-        await db
-          .update(heartbeatRuns)
-          .set({
-            resultJson: {
-              ...parseObject(successorRun.resultJson),
-              operatorCancellationTerminationPending: true,
-            },
-            updatedAt: new Date(),
-          })
-          .where(eq(heartbeatRuns.id, successorRun.id));
         logger.warn(
           { err, runId: successorRun.id },
           "failed to terminate causally linked run after operator cancellation",
         );
       } finally {
         if (!terminationFailed) {
+          const resultJson = parseObject(successorRun.resultJson);
+          delete resultJson.operatorCancellationTerminationPending;
+          const terminatedRun = await db
+            .update(heartbeatRuns)
+            .set({ resultJson, updatedAt: new Date() })
+            .where(eq(heartbeatRuns.id, successorRun.id))
+            .returning()
+            .then((rows) => rows[0] ?? successorRun);
           runningProcesses.delete(successorRun.id);
           clearHeartbeatRunRuntimeStatus(successorRun.id);
           publishLiveEvent({
-            companyId: successorRun.companyId,
+            companyId: terminatedRun.companyId,
             type: "heartbeat.run.status",
-            payload: buildHeartbeatRunStatusLiveEventPayload(successorRun),
+            payload: buildHeartbeatRunStatusLiveEventPayload(terminatedRun),
           });
-          publishRunLifecyclePluginEvent(successorRun);
+          publishRunLifecyclePluginEvent(terminatedRun);
         }
       }
     }
