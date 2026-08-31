@@ -4471,7 +4471,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   });
 
   it("does not promote deferred work or create a successor for a suppressed issue-bound cancellation", async () => {
-    const { companyId, agentId, issueId, runId } = await seedRunFixture({
+    const { companyId, agentId, issueId, runId, wakeupRequestId } = await seedRunFixture({
       agentStatus: "running",
       includeIssue: true,
     });
@@ -4541,11 +4541,35 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       },
     ]);
 
-    await heartbeat.cancelRun(runId, "Cancelled by a board operator", {
+    let releaseWakeupLock: (() => void) | null = null;
+    let wakeupLocked: (() => void) | null = null;
+    const wakeupLockAcquired = new Promise<void>((resolve) => {
+      wakeupLocked = resolve;
+    });
+    const holdWakeupLock = db.transaction(async (tx) => {
+      await tx.execute(sql`select 1 from ${agentWakeupRequests} where ${agentWakeupRequests.id} = ${wakeupRequestId} for update`);
+      wakeupLocked?.();
+      await new Promise<void>((resolve) => {
+        releaseWakeupLock = resolve;
+      });
+    });
+    await wakeupLockAcquired;
+
+    const cancellation = heartbeat.cancelRun(runId, "Cancelled by a board operator", {
       suppressImmediateRecovery: true,
       suppressDeferredPromotion: true,
       resultJson: { cancelledByActorType: "user" },
     });
+
+    await waitForValue(async () => {
+      const current = await heartbeat.getRun(runId);
+      return current?.status === "cancelled" ? current : null;
+    });
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.drainActiveRunExecutions();
+    releaseWakeupLock?.();
+    await holdWakeupLock;
+    await cancellation;
 
     const issueRuns = await db
       .select({ id: heartbeatRuns.id, status: heartbeatRuns.status, startedAt: heartbeatRuns.startedAt })
