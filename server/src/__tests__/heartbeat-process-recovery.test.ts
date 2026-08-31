@@ -5524,6 +5524,126 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(mockAdapterExecute.mock.calls.filter(([ctx]) => ctx?.runId === nextRunId)).toHaveLength(1);
   });
 
+  it("durably quarantines a live target run before its failed termination settles", async () => {
+    const { companyId, agentId, issueId, runId, wakeupRequestId } = await seedRunFixture({
+      agentStatus: "idle",
+      runStatus: "queued",
+      includeIssue: true,
+    });
+    await db
+      .update(agentWakeupRequests)
+      .set({ status: "queued", claimedAt: null })
+      .where(eq(agentWakeupRequests.id, wakeupRequestId));
+    const nextWakeupId = randomUUID();
+    const nextRunId = randomUUID();
+    let adapterStarted: (() => void) | null = null;
+    const adapterStartBarrier = new Promise<void>((resolve) => {
+      adapterStarted = resolve;
+    });
+    let releaseAdapter: (() => void) | null = null;
+    const adapterReleaseBarrier = new Promise<void>((resolve) => {
+      releaseAdapter = resolve;
+    });
+    mockAdapterExecute.mockImplementationOnce(async (ctx: { runId: string }) => {
+      expect(ctx.runId).toBe(runId);
+      runningProcesses.set(runId, {
+        child: { pid: 23456 } as ChildProcess,
+        graceSec: 1,
+        processGroupId: null,
+      });
+      adapterStarted?.();
+      await adapterReleaseBarrier;
+      runningProcesses.delete(runId);
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Cancelled target adapter exited during explicit cleanup.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+    let terminationStarted: (() => void) | null = null;
+    const terminationStartBarrier = new Promise<void>((resolve) => {
+      terminationStarted = resolve;
+    });
+    let rejectTermination: (() => void) | null = null;
+    const terminationFailureBarrier = new Promise<void>((resolve) => {
+      rejectTermination = resolve;
+    });
+    mockTerminateLocalService.mockImplementationOnce(async () => {
+      terminationStarted?.();
+      await terminationFailureBarrier;
+      throw new Error("simulated target termination failure");
+    });
+
+    const heartbeat = heartbeatService(db);
+    await heartbeat.resumeQueuedRuns();
+    await adapterStartBarrier;
+    await db.insert(agentWakeupRequests).values({
+      id: nextWakeupId,
+      companyId,
+      agentId,
+      source: "on_demand",
+      triggerDetail: "manual",
+      reason: "unrelated_work",
+      payload: {},
+      status: "queued",
+      runId: nextRunId,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: nextRunId,
+      companyId,
+      agentId,
+      invocationSource: "on_demand",
+      triggerDetail: "manual",
+      status: "queued",
+      wakeupRequestId: nextWakeupId,
+      contextSnapshot: { wakeReason: "manual" },
+    });
+    const cancellation = heartbeat.cancelRun(runId, "Cancelled by a board operator", {
+      suppressImmediateRecovery: true,
+      suppressDeferredPromotion: true,
+      resultJson: { cancelledByActorType: "user" },
+    });
+    await terminationStartBarrier;
+
+    expect(await heartbeat.getRun(runId)).toMatchObject({
+      status: "cancelled",
+      processPid: 23456,
+      resultJson: expect.objectContaining({ operatorCancellationTerminationPending: true }),
+    });
+    expect(await db
+      .select({ status: agentWakeupRequests.status })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, wakeupRequestId))
+      .then((rows) => rows[0]?.status)).toBe("cancelled");
+    expect(await db
+      .select({ executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]?.executionRunId)).toBeNull();
+
+    runningProcesses.delete(runId);
+    const restartedHeartbeat = heartbeatService(db);
+    await restartedHeartbeat.resumeQueuedRuns();
+    expect((await restartedHeartbeat.getRun(nextRunId))?.status).toBe("queued");
+
+    rejectTermination?.();
+    await expect(cancellation).resolves.toMatchObject({ id: runId, status: "cancelled" });
+    mockTerminateLocalService.mockImplementationOnce(async () => {
+      releaseAdapter?.();
+    });
+    expect((await restartedHeartbeat.reapOrphanedRuns()).runIds).toContain(runId);
+    await restartedHeartbeat.drainActiveRunExecutions();
+    await heartbeat.drainActiveRunExecutions();
+    expect(((await restartedHeartbeat.getRun(runId))?.resultJson as Record<string, unknown> | null)
+      ?.operatorCancellationTerminationPending).toBeUndefined();
+    await waitForRunToSettle(restartedHeartbeat, nextRunId);
+    expect(mockAdapterExecute.mock.calls.filter(([ctx]) => ctx?.runId === nextRunId)).toHaveLength(1);
+  });
+
   it("preserves an independent issue run claimed before operator cancellation acquires the issue lock", async () => {
     const { companyId, agentId, issueId, runId } = await seedRunFixture({
       agentStatus: "idle",
