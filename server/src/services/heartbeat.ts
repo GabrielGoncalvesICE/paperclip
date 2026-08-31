@@ -12568,17 +12568,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       issueContext: issueId ? await getIssueExecutionContext(run.companyId, issueId) : null,
       routineEnvContext: { routineId: null, env: null, responsibleUserId: null },
     });
-    const claimed = await db
-      .update(heartbeatRuns)
-      .set({
-        status: "running",
-        responsibleUserId,
-        startedAt: run.startedAt ?? claimedAt,
-        updatedAt: claimedAt,
-      })
-      .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
-      .returning()
-      .then((rows) => rows[0] ?? null);
+    const claimed = await db.transaction(async (tx) => {
+      if (issueId) {
+        await tx.execute(
+          sql`select id from issues where company_id = ${run.companyId} and id = ${issueId} for update`,
+        );
+      }
+
+      return tx
+        .update(heartbeatRuns)
+        .set({
+          status: "running",
+          responsibleUserId,
+          startedAt: run.startedAt ?? claimedAt,
+          updatedAt: claimedAt,
+        })
+        .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+    });
     if (!claimed) return null;
 
     publishLiveEvent({
@@ -18931,16 +18939,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     patch: Partial<typeof heartbeatRuns.$inferInsert>,
   ) {
     const now = new Date();
-    const cancelled = await db.transaction(async (tx) => {
+    const cancellation = await db.transaction(async (tx) => {
+      await tx.execute(
+        sql`select id from issues where company_id = ${run.companyId} and id = ${issueId} for update`,
+      );
       const updated = await tx
         .update(heartbeatRuns)
         .set({ status: "cancelled", ...patch, updatedAt: now })
         .where(eq(heartbeatRuns.id, run.id))
         .returning()
         .then((rows) => rows[0] ?? null);
-      if (!updated) return null;
+      if (!updated) return { updated: null, successorRuns: [] };
 
-      const queuedRuns = await tx
+      const successorRuns = await tx
         .update(heartbeatRuns)
         .set({
           status: "cancelled",
@@ -18953,15 +18964,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           and(
             eq(heartbeatRuns.companyId, run.companyId),
             eq(heartbeatRuns.agentId, run.agentId),
-            eq(heartbeatRuns.status, "queued"),
+            inArray(heartbeatRuns.status, ["queued", "running"]),
             sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
             sql`${heartbeatRuns.id} <> ${run.id}`,
           ),
         )
-        .returning({ wakeupRequestId: heartbeatRuns.wakeupRequestId });
+        .returning({
+          id: heartbeatRuns.id,
+          processPid: heartbeatRuns.processPid,
+          processGroupId: heartbeatRuns.processGroupId,
+          wakeupRequestId: heartbeatRuns.wakeupRequestId,
+        });
 
-      const wakeupRequestIds = queuedRuns
-        .map((queuedRun) => queuedRun.wakeupRequestId)
+      const wakeupRequestIds = successorRuns
+        .map((successorRun) => successorRun.wakeupRequestId)
         .filter((wakeupRequestId): wakeupRequestId is string => Boolean(wakeupRequestId));
       if (wakeupRequestIds.length > 0) {
         await tx
@@ -18975,8 +18991,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .where(inArray(agentWakeupRequests.id, wakeupRequestIds));
       }
 
-      return updated;
+      return { updated, successorRuns };
     });
+    const cancelled = cancellation.updated;
+
+    for (const successorRun of cancellation.successorRuns) {
+      const running = runningProcesses.get(successorRun.id);
+      if (running || successorRun.processPid || successorRun.processGroupId) {
+        await terminateHeartbeatRunProcess({
+          pid: running?.child.pid ?? successorRun.processPid,
+          processGroupId: running?.processGroupId ?? successorRun.processGroupId,
+          ...(running ? { graceMs: Math.max(1, running.graceSec) * 1000 } : {}),
+        });
+      }
+      runningProcesses.delete(successorRun.id);
+      clearHeartbeatRunRuntimeStatus(successorRun.id);
+    }
 
     if (cancelled) {
       clearHeartbeatRunRuntimeStatus(cancelled.id);
@@ -19007,6 +19037,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
       : options.resultJson;
 
+    const finishedAt = new Date();
+    const cancellationPatch = {
+      finishedAt,
+      error: reason,
+      errorCode,
+      ...(resultJson ? { resultJson } : {}),
+    };
+    const issueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
+    let cancelled = options.suppressDeferredPromotion && issueId
+      ? await cancelRunAndQueuedRunsForIssue(run, issueId, cancellationPatch)
+      : null;
+
     const running = runningProcesses.get(run.id);
     try {
       if (running) {
@@ -19025,17 +19067,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       runningProcesses.delete(run.id);
     }
 
-    const finishedAt = new Date();
-    const cancellationPatch = {
-      finishedAt,
-      error: reason,
-      errorCode,
-      ...(resultJson ? { resultJson } : {}),
-    };
-    const issueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
-    const cancelled = options.suppressDeferredPromotion && issueId
-      ? await cancelRunAndQueuedRunsForIssue(run, issueId, cancellationPatch)
-      : await setRunStatus(run.id, "cancelled", cancellationPatch);
+    if (!cancelled && !(options.suppressDeferredPromotion && issueId)) {
+      cancelled = await setRunStatus(run.id, "cancelled", cancellationPatch);
+    }
 
     await setWakeupStatus(run.wakeupRequestId, "cancelled", {
       finishedAt,
