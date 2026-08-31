@@ -17767,6 +17767,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .where(
             and(
               eq(agentWakeupRequests.companyId, issue.companyId),
+              eq(agentWakeupRequests.agentId, run.agentId),
               eq(agentWakeupRequests.status, "deferred_issue_execution"),
               sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`,
             ),
@@ -19814,9 +19815,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .where(eq(heartbeatRuns.id, run.id))
         .returning()
         .then((rows) => rows[0] ?? null);
-      if (!updated) return { updated: null, successorRuns: [] };
+      if (!updated) return null;
 
-      const successorRuns = await tx
+      const queuedRuns = await tx
         .update(heartbeatRuns)
         .set({
           status: "cancelled",
@@ -19829,20 +19830,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           and(
             eq(heartbeatRuns.companyId, run.companyId),
             eq(heartbeatRuns.agentId, run.agentId),
-            inArray(heartbeatRuns.status, ["queued", "running"]),
+            eq(heartbeatRuns.status, "queued"),
             sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
             sql`${heartbeatRuns.id} <> ${run.id}`,
           ),
         )
-        .returning({
-          id: heartbeatRuns.id,
-          processPid: heartbeatRuns.processPid,
-          processGroupId: heartbeatRuns.processGroupId,
-          wakeupRequestId: heartbeatRuns.wakeupRequestId,
-        });
+        .returning({ wakeupRequestId: heartbeatRuns.wakeupRequestId });
 
-      const wakeupRequestIds = successorRuns
-        .map((successorRun) => successorRun.wakeupRequestId)
+      const wakeupRequestIds = queuedRuns
+        .map((queuedRun) => queuedRun.wakeupRequestId)
         .filter((wakeupRequestId): wakeupRequestId is string => Boolean(wakeupRequestId));
       if (wakeupRequestIds.length > 0) {
         await tx
@@ -19856,22 +19852,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .where(inArray(agentWakeupRequests.id, wakeupRequestIds));
       }
 
-      return { updated, successorRuns };
+      return updated;
     });
-    const cancelled = cancellation.updated;
-
-    for (const successorRun of cancellation.successorRuns) {
-      const running = runningProcesses.get(successorRun.id);
-      if (running || successorRun.processPid || successorRun.processGroupId) {
-        await terminateHeartbeatRunProcess({
-          pid: running?.child.pid ?? successorRun.processPid,
-          processGroupId: running?.processGroupId ?? successorRun.processGroupId,
-          ...(running ? { graceMs: Math.max(1, running.graceSec) * 1000 } : {}),
-        });
-      }
-      runningProcesses.delete(successorRun.id);
-      clearHeartbeatRunRuntimeStatus(successorRun.id);
-    }
+    const cancelled = cancellation;
 
     if (cancelled) {
       clearHeartbeatRunRuntimeStatus(cancelled.id);
