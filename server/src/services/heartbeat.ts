@@ -13953,6 +13953,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
+    const reaped: string[] = [];
 
     // A terminal issue transition writes this intent in the same transaction
     // that expires the native question. Consume it before generic orphan
@@ -14004,6 +14005,55 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
     }
 
+    const pendingOperatorCancellationTerminations = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.status, "cancelled"),
+          eq(heartbeatRuns.errorCode, "operator_cancelled_issue_run"),
+          sql`${heartbeatRuns.resultJson} ->> 'operatorCancellationTerminationPending' = 'true'`,
+        ),
+      );
+    for (const pendingRun of pendingOperatorCancellationTerminations) {
+      const running = runningProcesses.get(pendingRun.id);
+      try {
+        if (running || pendingRun.processPid || pendingRun.processGroupId) {
+          await terminateHeartbeatRunProcess({
+            pid: running?.child.pid ?? pendingRun.processPid,
+            processGroupId: running?.processGroupId ?? pendingRun.processGroupId,
+            ...(running ? { graceMs: Math.max(1, running.graceSec) * 1000 } : {}),
+          });
+        }
+      } catch (err) {
+        logger.warn(
+          { err, runId: pendingRun.id },
+          "retry failed for causally cancelled process termination",
+        );
+        continue;
+      }
+
+      const resultJson = parseObject(pendingRun.resultJson);
+      delete resultJson.operatorCancellationTerminationPending;
+      const cleanedRun = await db
+        .update(heartbeatRuns)
+        .set({ resultJson, updatedAt: now })
+        .where(eq(heartbeatRuns.id, pendingRun.id))
+        .returning()
+        .then((rows) => rows[0] ?? pendingRun);
+      runningProcesses.delete(pendingRun.id);
+      clearHeartbeatRunRuntimeStatus(pendingRun.id);
+      publishLiveEvent({
+        companyId: cleanedRun.companyId,
+        type: "heartbeat.run.status",
+        payload: buildHeartbeatRunStatusLiveEventPayload(cleanedRun),
+      });
+      publishRunLifecyclePluginEvent(cleanedRun);
+      await finalizeAgentStatus(cleanedRun.agentId, "cancelled");
+      await startNextQueuedRunForAgent(cleanedRun.agentId);
+      reaped.push(cleanedRun.id);
+    }
+
     // Find all runs stuck in "running" state (queued runs are legitimately waiting; resumeQueuedRuns handles them)
     const activeRuns = await db
       .select({
@@ -14037,8 +14087,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         issue.monitorNextCheckAt,
       ]),
     );
-
-    const reaped: string[] = [];
 
     for (const { run, adapterType, adapterConfig } of activeRuns) {
       if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) continue;
@@ -14365,6 +14413,37 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return withAgentStartLock(agentId, async () => {
       const agent = await getAgent(agentId);
       if (!agent) return [];
+      const pendingCancelledSuccessorTermination = await db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.agentId, agentId),
+            eq(heartbeatRuns.status, "cancelled"),
+            eq(heartbeatRuns.errorCode, "operator_cancelled_issue_run"),
+            sql`${heartbeatRuns.resultJson} ->> 'operatorCancellationTerminationPending' = 'true'`,
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (pendingCancelledSuccessorTermination) return [];
+      const trackedProcessRunIds = [...runningProcesses.keys()];
+      if (trackedProcessRunIds.length > 0) {
+        const trackedCancelledSuccessor = await db
+          .select({ id: heartbeatRuns.id })
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.agentId, agentId),
+              inArray(heartbeatRuns.id, trackedProcessRunIds),
+              eq(heartbeatRuns.status, "cancelled"),
+              eq(heartbeatRuns.errorCode, "operator_cancelled_issue_run"),
+            ),
+          )
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (trackedCancelledSuccessor) return [];
+      }
       const invokability = await getAgentInvokability(agent);
       if (!invokability.invokable) {
         if (shouldCancelRunsForNonInvokableAgent(invokability)) {
@@ -19941,8 +20020,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
     const cancelled = cancellation?.updated ?? null;
 
+    let successorTerminationFailed = false;
     for (const successorRun of cancellation?.successorRuns ?? []) {
       const running = runningProcesses.get(successorRun.id);
+      let terminationFailed = false;
       try {
         if (running || successorRun.processPid || successorRun.processGroupId) {
           await terminateHeartbeatRunProcess({
@@ -19952,22 +20033,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           });
         }
       } catch (err) {
-        // The database transaction already made the run and wake terminal and
-        // cleared any execution lock. Process cleanup is best-effort from here:
-        // a local supervisor failure must not make cancellation unretryable.
+        terminationFailed = true;
+        successorTerminationFailed = true;
+        await db
+          .update(heartbeatRuns)
+          .set({
+            resultJson: {
+              ...parseObject(successorRun.resultJson),
+              operatorCancellationTerminationPending: true,
+            },
+            updatedAt: new Date(),
+          })
+          .where(eq(heartbeatRuns.id, successorRun.id));
         logger.warn(
           { err, runId: successorRun.id },
           "failed to terminate causally linked run after operator cancellation",
         );
       } finally {
-        runningProcesses.delete(successorRun.id);
-        clearHeartbeatRunRuntimeStatus(successorRun.id);
-        publishLiveEvent({
-          companyId: successorRun.companyId,
-          type: "heartbeat.run.status",
-          payload: buildHeartbeatRunStatusLiveEventPayload(successorRun),
-        });
-        publishRunLifecyclePluginEvent(successorRun);
+        if (!terminationFailed) {
+          runningProcesses.delete(successorRun.id);
+          clearHeartbeatRunRuntimeStatus(successorRun.id);
+          publishLiveEvent({
+            companyId: successorRun.companyId,
+            type: "heartbeat.run.status",
+            payload: buildHeartbeatRunStatusLiveEventPayload(successorRun),
+          });
+          publishRunLifecyclePluginEvent(successorRun);
+        }
       }
     }
 
@@ -19980,7 +20072,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
       publishRunLifecyclePluginEvent(cancelled);
     }
-    return cancelled;
+    return { cancelled, successorTerminationFailed };
   }
 
   async function cancelRunInternal(runId: string, reason = "Cancelled by control plane", options: CancelRunOptions = {}) {
@@ -20008,9 +20100,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       ...(resultJson ? { resultJson } : {}),
     };
     const issueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
-    let cancelled = options.suppressDeferredPromotion && issueId
+    const issueCancellation = options.suppressDeferredPromotion && issueId
       ? await cancelRunAndQueuedRunsForIssue(run, issueId, cancellationPatch)
       : null;
+    let cancelled = issueCancellation?.cancelled ?? null;
+    const successorTerminationFailed = issueCancellation?.successorTerminationFailed ?? false;
 
     const running = runningProcesses.get(run.id);
     try {
@@ -20053,10 +20147,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
     }
 
-    await finalizeAgentStatus(run.agentId, "cancelled", undefined, {
-      wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
-    });
-    await startNextQueuedRunForAgent(run.agentId);
+    if (!successorTerminationFailed) {
+      await finalizeAgentStatus(run.agentId, "cancelled", undefined, {
+        wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
+      });
+      await startNextQueuedRunForAgent(run.agentId);
+    }
     return cancelled;
   }
 
