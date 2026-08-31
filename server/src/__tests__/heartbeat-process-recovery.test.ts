@@ -4477,6 +4477,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
     const heartbeat = heartbeatService(db);
     const deferredWakeupId = randomUUID();
+    const queuedSameIssueWakeupId = randomUUID();
+    const queuedSameIssueRunId = randomUUID();
+    const unrelatedWakeupId = randomUUID();
+    const unrelatedRunId = randomUUID();
     await db.insert(agentWakeupRequests).values({
       id: deferredWakeupId,
       companyId,
@@ -4490,6 +4494,52 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       },
       status: "deferred_issue_execution",
     });
+    await db.insert(agentWakeupRequests).values([
+      {
+        id: queuedSameIssueWakeupId,
+        companyId,
+        agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_assigned",
+        payload: { issueId },
+        status: "queued",
+        runId: queuedSameIssueRunId,
+      },
+      {
+        id: unrelatedWakeupId,
+        companyId,
+        agentId,
+        source: "on_demand",
+        triggerDetail: "manual",
+        reason: "unrelated_work",
+        payload: {},
+        status: "queued",
+        runId: unrelatedRunId,
+      },
+    ]);
+    await db.insert(heartbeatRuns).values([
+      {
+        id: queuedSameIssueRunId,
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "queued",
+        wakeupRequestId: queuedSameIssueWakeupId,
+        contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+      },
+      {
+        id: unrelatedRunId,
+        companyId,
+        agentId,
+        invocationSource: "on_demand",
+        triggerDetail: "manual",
+        status: "queued",
+        wakeupRequestId: unrelatedWakeupId,
+        contextSnapshot: { wakeReason: "unrelated_work" },
+      },
+    ]);
 
     await heartbeat.cancelRun(runId, "Cancelled by a board operator", {
       suppressImmediateRecovery: true,
@@ -4497,8 +4547,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       resultJson: { cancelledByActorType: "user" },
     });
 
-    const successors = await db
-      .select({ id: heartbeatRuns.id })
+    const issueRuns = await db
+      .select({ id: heartbeatRuns.id, status: heartbeatRuns.status, startedAt: heartbeatRuns.startedAt })
       .from(heartbeatRuns)
       .where(
         and(
@@ -4507,7 +4557,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
           sql`${heartbeatRuns.id} <> ${runId}`,
         ),
       );
-    expect(successors).toHaveLength(0);
+    expect(issueRuns).toEqual([
+      expect.objectContaining({ id: queuedSameIssueRunId, status: "cancelled", startedAt: null }),
+    ]);
 
     const deferredWakeup = await db
       .select({ status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
@@ -4515,6 +4567,16 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .where(eq(agentWakeupRequests.id, deferredWakeupId))
       .then((rows) => rows[0]);
     expect(deferredWakeup).toEqual({ status: "cancelled", runId: null });
+
+    const queuedSameIssueWakeup = await db
+      .select({ status: agentWakeupRequests.status })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, queuedSameIssueWakeupId))
+      .then((rows) => rows[0]);
+    expect(queuedSameIssueWakeup?.status).toBe("cancelled");
+
+    const unrelatedRun = await waitForRunToSettle(heartbeat, unrelatedRunId);
+    expect(unrelatedRun?.status).toBe("succeeded");
   });
 
   it("dispatches assigned todo work with no prior run as a normal assignment wake", async () => {
