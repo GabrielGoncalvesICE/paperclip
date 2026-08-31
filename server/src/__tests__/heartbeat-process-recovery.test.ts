@@ -106,6 +106,7 @@ import {
   redactDetectedSuccessfulRunProgressSummaryForBoard,
   redactSuccessfulRunHandoffEvidence,
 } from "../services/heartbeat.ts";
+import { subscribeCompanyLiveEvents } from "../services/live-events.ts";
 import {
   readHotRestartIntent,
   resolveLegacyHotRestartIntentPath,
@@ -4471,10 +4472,14 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   });
 
   it("does not promote deferred work or create a successor for a suppressed issue-bound cancellation", async () => {
-    const { companyId, agentId, issueId, runId, wakeupRequestId } = await seedRunFixture({
+    const { companyId, agentId, issueId, runId } = await seedRunFixture({
       agentStatus: "running",
       includeIssue: true,
     });
+    await db
+      .update(agents)
+      .set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 2 } } })
+      .where(eq(agents.id, agentId));
     const heartbeat = heartbeatService(db);
     const deferredWakeupId = randomUUID();
     const peerAgentId = randomUUID();
@@ -4539,7 +4544,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         source: "on_demand",
         triggerDetail: "manual",
         reason: "unrelated_work",
-        payload: {},
+        payload: { issueId },
         status: "queued",
         runId: unrelatedRunId,
       },
@@ -4563,23 +4568,31 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         triggerDetail: "manual",
         status: "queued",
         wakeupRequestId: unrelatedWakeupId,
-        contextSnapshot: { wakeReason: "unrelated_work" },
+        contextSnapshot: { issueId, wakeReason: "manual" },
       },
     ]);
 
-    let releaseWakeupLock: (() => void) | null = null;
-    let wakeupLocked: (() => void) | null = null;
-    const wakeupLockAcquired = new Promise<void>((resolve) => {
-      wakeupLocked = resolve;
+    const siblingStatusEvents: string[] = [];
+    const unsubscribe = subscribeCompanyLiveEvents(companyId, (event) => {
+      const payload = event.payload as { runId?: string; status?: string };
+      if (event.type === "heartbeat.run.status" && payload.runId === queuedSameIssueRunId && payload.status) {
+        siblingStatusEvents.push(payload.status);
+      }
     });
-    const holdWakeupLock = db.transaction(async (tx) => {
-      await tx.execute(sql`select 1 from ${agentWakeupRequests} where ${agentWakeupRequests.id} = ${wakeupRequestId} for update`);
-      wakeupLocked?.();
+
+    let releaseTargetRunLock: (() => void) | null = null;
+    let targetRunLocked: (() => void) | null = null;
+    const targetRunLockAcquired = new Promise<void>((resolve) => {
+      targetRunLocked = resolve;
+    });
+    const holdTargetRunLock = db.transaction(async (tx) => {
+      await tx.execute(sql`select id from heartbeat_runs where id = ${runId} for update`);
+      targetRunLocked?.();
       await new Promise<void>((resolve) => {
-        releaseWakeupLock = resolve;
+        releaseTargetRunLock = resolve;
       });
     });
-    await wakeupLockAcquired;
+    await targetRunLockAcquired;
 
     const cancellation = heartbeat.cancelRun(runId, "Cancelled by a board operator", {
       suppressImmediateRecovery: true,
@@ -4588,16 +4601,26 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
 
     await waitForValue(async () => {
-      const current = await heartbeat.getRun(runId);
-      return current?.status === "cancelled" ? current : null;
+      try {
+        await db.transaction((tx) =>
+          tx.execute(sql`select id from issues where id = ${issueId} for update nowait`)
+        );
+        return null;
+      } catch {
+        return true;
+      }
     });
-    await heartbeat.resumeQueuedRuns();
-    await heartbeat.drainActiveRunExecutions();
-    releaseWakeupLock?.();
-    await holdWakeupLock;
+    const competingClaim = heartbeat.resumeQueuedRuns();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    releaseTargetRunLock?.();
+    await holdTargetRunLock;
     await cancellation;
+    await competingClaim;
+    await heartbeat.drainActiveRunExecutions();
 
-    const issueRuns = await db
+    unsubscribe();
+
+    const causalSuccessorRuns = await db
       .select({ id: heartbeatRuns.id, status: heartbeatRuns.status, startedAt: heartbeatRuns.startedAt })
       .from(heartbeatRuns)
       .where(
@@ -4605,10 +4628,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
           eq(heartbeatRuns.companyId, companyId),
           eq(heartbeatRuns.agentId, agentId),
           sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+          sql`${heartbeatRuns.contextSnapshot} ->> 'queuedAsFollowupToRunId' = ${runId}`,
           sql`${heartbeatRuns.id} <> ${runId}`,
         ),
       );
-    expect(issueRuns).toEqual([
+    expect(causalSuccessorRuns).toEqual([
       expect.objectContaining({ id: queuedSameIssueRunId, status: "cancelled", startedAt: null }),
     ]);
 
@@ -4632,6 +4656,15 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .where(eq(agentWakeupRequests.id, queuedSameIssueWakeupId))
       .then((rows) => rows[0]);
     expect(queuedSameIssueWakeup?.status).toBe("cancelled");
+
+    const issue = await db
+      .select({ executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(issue?.executionRunId).not.toBe(queuedSameIssueRunId);
+    expect(JSON.stringify(mockAdapterExecute.mock.calls)).not.toContain(queuedSameIssueRunId);
+    expect(siblingStatusEvents.at(-1)).toBe("cancelled");
 
     const unrelatedRun = await waitForRunToSettle(heartbeat, unrelatedRunId);
     expect(unrelatedRun?.status).toBe("succeeded");

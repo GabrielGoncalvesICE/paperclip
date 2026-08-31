@@ -12575,7 +12575,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         );
       }
 
-      return tx
+      const updated = await tx
         .update(heartbeatRuns)
         .set({
           status: "running",
@@ -12586,53 +12586,57 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
         .returning()
         .then((rows) => rows[0] ?? null);
+      if (!updated) return null;
+
+      if (updated.wakeupRequestId) {
+        await tx
+          .update(agentWakeupRequests)
+          .set({ status: "claimed", claimedAt, updatedAt: claimedAt })
+          .where(eq(agentWakeupRequests.id, updated.wakeupRequestId));
+      }
+
+      const claimedWakeReason = readNonEmptyString(context.wakeReason);
+      if (issueId && claimedWakeReason !== "source_scoped_recovery_action") {
+        await tx
+          .update(issues)
+          .set({
+            executionRunId: updated.id,
+            executionAgentNameKey: normalizeAgentNameKey(agent.name),
+            executionLockedAt: claimedAt,
+            updatedAt: claimedAt,
+          })
+          .where(
+            and(
+              eq(issues.id, issueId),
+              eq(issues.companyId, updated.companyId),
+              eq(issues.assigneeAgentId, updated.agentId),
+              or(isNull(issues.executionRunId), eq(issues.executionRunId, updated.id)),
+            ),
+          );
+      }
+
+      // Publish while the issue row is still locked so an exact-run
+      // cancellation cannot publish a terminal successor event first.
+      if (issueId) {
+        publishLiveEvent({
+          companyId: updated.companyId,
+          type: "heartbeat.run.status",
+          payload: buildHeartbeatRunStatusLiveEventPayload(updated),
+        });
+        publishRunLifecyclePluginEvent(updated);
+      }
+      return updated;
     });
     if (!claimed) return null;
 
-    publishLiveEvent({
-      companyId: claimed.companyId,
-      type: "heartbeat.run.status",
-      payload: {
-        runId: claimed.id,
-        agentId: claimed.agentId,
-        status: claimed.status,
-        invocationSource: claimed.invocationSource,
-        triggerDetail: claimed.triggerDetail,
-        error: claimed.error ?? null,
-        errorCode: claimed.errorCode ?? null,
-        startedAt: claimed.startedAt ? new Date(claimed.startedAt).toISOString() : null,
-        finishedAt: claimed.finishedAt ? new Date(claimed.finishedAt).toISOString() : null,
-      },
-    });
-    publishRunLifecyclePluginEvent(claimed);
-
-    await setWakeupStatus(claimed.wakeupRequestId, "claimed", { claimedAt });
-
-    // Fix A (lazy locking): stamp executionRunId now that the run is actually running,
-    // not at queue time. Guard is idempotent — safe if called more than once.
-    const claimedContext = parseObject(claimed.contextSnapshot);
-    const claimedIssueId = readNonEmptyString(claimedContext.issueId);
-    const claimedWakeReason = readNonEmptyString(claimedContext.wakeReason);
-    if (claimedIssueId && claimedWakeReason !== "source_scoped_recovery_action") {
-      const claimedAgent = await getAgent(claimed.agentId);
-      await db
-        .update(issues)
-        .set({
-          executionRunId: claimed.id,
-          executionAgentNameKey: normalizeAgentNameKey(claimedAgent?.name),
-          executionLockedAt: claimedAt,
-          updatedAt: claimedAt,
-        })
-        .where(
-          and(
-            eq(issues.id, claimedIssueId),
-            eq(issues.companyId, claimed.companyId),
-            // Mention/context runs can touch an issue, but only the current assignee
-            // owns the issue execution lock shown as the active run.
-            eq(issues.assigneeAgentId, claimed.agentId),
-            or(isNull(issues.executionRunId), eq(issues.executionRunId, claimed.id)),
-          ),
-        );
+    if (!issueId) {
+      publishLiveEvent({
+        companyId: claimed.companyId,
+        type: "heartbeat.run.status",
+        payload: buildHeartbeatRunStatusLiveEventPayload(claimed),
+      });
+      publishRunLifecyclePluginEvent(claimed);
+      await setWakeupStatus(claimed.wakeupRequestId, "claimed", { claimedAt });
     }
 
     return claimed;
@@ -18956,7 +18960,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .then((rows) => rows[0] ?? null);
       if (!updated) return null;
 
-      const queuedRuns = await tx
+      const successorRuns = await tx
         .update(heartbeatRuns)
         .set({
           status: "cancelled",
@@ -18969,15 +18973,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           and(
             eq(heartbeatRuns.companyId, run.companyId),
             eq(heartbeatRuns.agentId, run.agentId),
-            eq(heartbeatRuns.status, "queued"),
+            inArray(heartbeatRuns.status, ["queued", "running"]),
             sql`${heartbeatRuns.contextSnapshot} ->> 'queuedAsFollowupToRunId' = ${run.id}`,
             sql`${heartbeatRuns.id} <> ${run.id}`,
           ),
         )
-        .returning({ wakeupRequestId: heartbeatRuns.wakeupRequestId });
+        .returning();
 
-      const wakeupRequestIds = queuedRuns
-        .map((queuedRun) => queuedRun.wakeupRequestId)
+      const wakeupRequestIds = successorRuns
+        .map((successorRun) => successorRun.wakeupRequestId)
         .filter((wakeupRequestId): wakeupRequestId is string => Boolean(wakeupRequestId));
       if (wakeupRequestIds.length > 0) {
         await tx
@@ -18991,9 +18995,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .where(inArray(agentWakeupRequests.id, wakeupRequestIds));
       }
 
-      return updated;
+      return { updated, successorRuns };
     });
-    const cancelled = cancellation;
+    const cancelled = cancellation?.updated ?? null;
+
+    for (const successorRun of cancellation?.successorRuns ?? []) {
+      const running = runningProcesses.get(successorRun.id);
+      if (running || successorRun.processPid || successorRun.processGroupId) {
+        await terminateHeartbeatRunProcess({
+          pid: running?.child.pid ?? successorRun.processPid,
+          processGroupId: running?.processGroupId ?? successorRun.processGroupId,
+          ...(running ? { graceMs: Math.max(1, running.graceSec) * 1000 } : {}),
+        });
+      }
+      runningProcesses.delete(successorRun.id);
+      clearHeartbeatRunRuntimeStatus(successorRun.id);
+      publishLiveEvent({
+        companyId: successorRun.companyId,
+        type: "heartbeat.run.status",
+        payload: buildHeartbeatRunStatusLiveEventPayload(successorRun),
+      });
+      publishRunLifecyclePluginEvent(successorRun);
+    }
 
     if (cancelled) {
       clearHeartbeatRunRuntimeStatus(cancelled.id);
