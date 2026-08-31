@@ -4968,7 +4968,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(mockAdapterExecute.mock.calls.filter(([ctx]) => ctx?.runId === nextRunId)).toHaveLength(1);
   });
 
-  it("durably quarantines a live target run before its failed termination settles", async () => {
+  it("defers peer issue handoff until a failed target termination is reaped", async () => {
     const { companyId, agentId, issueId, runId, wakeupRequestId } = await seedRunFixture({
       agentStatus: "idle",
       runStatus: "queued",
@@ -4978,8 +4978,18 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .update(agentWakeupRequests)
       .set({ status: "queued", claimedAt: null })
       .where(eq(agentWakeupRequests.id, wakeupRequestId));
-    const nextWakeupId = randomUUID();
-    const nextRunId = randomUUID();
+    const peerAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: peerAgentId,
+      companyId,
+      name: "PeerAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
     let adapterStarted: (() => void) | null = null;
     const adapterStartBarrier = new Promise<void>((resolve) => {
       adapterStarted = resolve;
@@ -5025,27 +5035,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const heartbeat = heartbeatService(db);
     await heartbeat.resumeQueuedRuns();
     await adapterStartBarrier;
-    await db.insert(agentWakeupRequests).values({
-      id: nextWakeupId,
-      companyId,
-      agentId,
-      source: "on_demand",
-      triggerDetail: "manual",
-      reason: "unrelated_work",
-      payload: {},
-      status: "queued",
-      runId: nextRunId,
-    });
-    await db.insert(heartbeatRuns).values({
-      id: nextRunId,
-      companyId,
-      agentId,
-      invocationSource: "on_demand",
-      triggerDetail: "manual",
-      status: "queued",
-      wakeupRequestId: nextWakeupId,
-      contextSnapshot: { wakeReason: "manual" },
-    });
     const cancellation = heartbeat.cancelRun(runId, "Cancelled by a board operator", {
       suppressImmediateRecovery: true,
       suppressDeferredPromotion: true,
@@ -5067,25 +5056,84 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .select({ executionRunId: issues.executionRunId })
       .from(issues)
       .where(eq(issues.id, issueId))
-      .then((rows) => rows[0]?.executionRunId)).toBeNull();
+      .then((rows) => rows[0]?.executionRunId)).toBe(runId);
+
+    await db
+      .update(issues)
+      .set({ assigneeAgentId: peerAgentId })
+      .where(eq(issues.id, issueId));
+    await expect(heartbeat.wakeup(peerAgentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId },
+      contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+    })).resolves.toBeNull();
+    const peerWake = await db
+      .select({ id: agentWakeupRequests.id, status: agentWakeupRequests.status })
+      .from(agentWakeupRequests)
+      .where(and(
+        eq(agentWakeupRequests.agentId, peerAgentId),
+        sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
+      ))
+      .then((rows) => rows[0]);
+    expect(peerWake?.status).toBe("deferred_issue_execution");
+    expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
 
     runningProcesses.delete(runId);
     const restartedHeartbeat = heartbeatService(db);
     await restartedHeartbeat.resumeQueuedRuns();
-    expect((await restartedHeartbeat.getRun(nextRunId))?.status).toBe("queued");
+    expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
 
     rejectTermination?.();
     await expect(cancellation).resolves.toMatchObject({ id: runId, status: "cancelled" });
     mockTerminateLocalService.mockImplementationOnce(async () => {
       releaseAdapter?.();
     });
+    let peerAdapterStarted: (() => void) | null = null;
+    const peerAdapterStartBarrier = new Promise<void>((resolve) => {
+      peerAdapterStarted = resolve;
+    });
+    let releasePeerAdapter: (() => void) | null = null;
+    const peerAdapterReleaseBarrier = new Promise<void>((resolve) => {
+      releasePeerAdapter = resolve;
+    });
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      peerAdapterStarted?.();
+      await peerAdapterReleaseBarrier;
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Peer handoff completed after target cleanup.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
     expect((await restartedHeartbeat.reapOrphanedRuns()).runIds).toContain(runId);
-    await restartedHeartbeat.drainActiveRunExecutions();
-    await heartbeat.drainActiveRunExecutions();
+    await peerAdapterStartBarrier;
     expect(((await restartedHeartbeat.getRun(runId))?.resultJson as Record<string, unknown> | null)
       ?.operatorCancellationTerminationPending).toBeUndefined();
-    await waitForRunToSettle(restartedHeartbeat, nextRunId);
-    expect(mockAdapterExecute.mock.calls.filter(([ctx]) => ctx?.runId === nextRunId)).toHaveLength(1);
+    const promotedPeerRunId = await db
+      .select({ runId: agentWakeupRequests.runId })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, peerWake!.id))
+      .then((rows) => rows[0]?.runId);
+    expect(promotedPeerRunId).toBeTruthy();
+    expect(mockAdapterExecute.mock.calls.filter(([ctx]) => ctx?.runId === promotedPeerRunId)).toHaveLength(1);
+    expect(await db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.agentId, peerAgentId),
+        sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+      ))
+      .then((rows) => rows[0]?.count)).toBe(1);
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
+    releasePeerAdapter?.();
+    await restartedHeartbeat.drainActiveRunExecutions();
+    await heartbeat.drainActiveRunExecutions();
   });
 
   it("preserves an independent issue run claimed before operator cancellation acquires the issue lock", async () => {
