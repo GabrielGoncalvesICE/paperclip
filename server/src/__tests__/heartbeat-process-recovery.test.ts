@@ -5138,6 +5138,57 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(unrelatedRun?.status).toBe("succeeded");
   });
 
+  it("cancels an issue successor claimed before operator cancellation acquires the issue lock", async () => {
+    const { companyId, agentId, issueId, runId } = await seedRunFixture({
+      agentStatus: "idle",
+      includeIssue: true,
+    });
+    await db
+      .update(agents)
+      .set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 2 } } })
+      .where(eq(agents.id, agentId));
+
+    const successorWakeupId = randomUUID();
+    const successorRunId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: successorWakeupId,
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId },
+      status: "claimed",
+      runId: successorRunId,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: successorRunId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "running",
+      wakeupRequestId: successorWakeupId,
+      contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+      startedAt: new Date(),
+    });
+
+    const heartbeat = heartbeatService(db);
+    await heartbeat.cancelRun(runId, "Cancelled by a board operator", {
+      suppressImmediateRecovery: true,
+      suppressDeferredPromotion: true,
+      resultJson: { cancelledByActorType: "user" },
+    });
+    await heartbeat.drainActiveRunExecutions();
+
+    const successor = await heartbeat.getRun(successorRunId);
+    expect(successor).toMatchObject({
+      status: "cancelled",
+      errorCode: "operator_cancelled_issue_run",
+    });
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+  });
+
   it("dispatches assigned todo work with no prior run as a normal assignment wake", async () => {
     const { companyId, agentId, issueId } = await seedAssignedTodoNoRunFixture();
     const heartbeat = heartbeatService(db);
