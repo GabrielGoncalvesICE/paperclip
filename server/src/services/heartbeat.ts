@@ -16777,7 +16777,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function releaseIssueExecutionAndPromote(
     run: typeof heartbeatRuns.$inferSelect,
-    options: { suppressImmediateRecovery?: boolean } = {},
+    options: {
+      suppressImmediateRecovery?: boolean;
+      suppressDeferredPromotion?: boolean;
+    } = {},
   ) {
     const runContext = parseObject(run.contextSnapshot);
     const contextIssueId = readNonEmptyString(runContext.issueId);
@@ -16917,7 +16920,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         };
       }
 
-      if (options.suppressImmediateRecovery) {
+      if (options.suppressDeferredPromotion) {
         const now = new Date();
         await tx
           .update(agentWakeupRequests)
@@ -18919,6 +18922,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     eventMessage?: string;
     eventPayload?: Record<string, unknown>;
     suppressImmediateRecovery?: boolean;
+    suppressDeferredPromotion?: boolean;
   };
 
   async function cancelRunInternal(runId: string, reason = "Cancelled by control plane", options: CancelRunOptions = {}) {
@@ -18979,6 +18983,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
       await releaseIssueExecutionAndPromote(cancelled, {
         suppressImmediateRecovery: options.suppressImmediateRecovery,
+        suppressDeferredPromotion: options.suppressDeferredPromotion,
       });
     }
 
