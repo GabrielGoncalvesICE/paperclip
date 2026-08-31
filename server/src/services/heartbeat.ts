@@ -13528,6 +13528,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         suppressImmediateRecovery: true,
         suppressDeferredPromotion,
         promoteOtherAgentsAfterDeferredSuppression: suppressDeferredPromotion,
+        deferredPromotionRequiredCleanupRunId: suppressDeferredPromotion
+          ? pendingRun.id
+          : undefined,
       });
       await finalizeAgentStatus(cleanedRun.agentId, "cancelled");
       await startNextQueuedRunForAgent(cleanedRun.agentId);
@@ -16878,6 +16881,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       suppressImmediateRecovery?: boolean;
       suppressDeferredPromotion?: boolean;
       promoteOtherAgentsAfterDeferredSuppression?: boolean;
+      deferredPromotionRequiredCleanupRunId?: string;
     } = {},
   ) {
     const runContext = parseObject(run.contextSnapshot);
@@ -17052,6 +17056,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               eq(agentWakeupRequests.companyId, issue.companyId),
               eq(agentWakeupRequests.status, "deferred_issue_execution"),
               sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`,
+              options.deferredPromotionRequiredCleanupRunId
+                ? sql`${agentWakeupRequests.payload} ->> 'operatorCancellationCleanupHandoffRunId' = ${options.deferredPromotionRequiredCleanupRunId}`
+                : undefined,
             ),
           )
           .orderBy(asc(agentWakeupRequests.requestedAt))
@@ -18473,9 +18480,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
 
           if (availableActiveExecutionRun) {
+            const cleanupHandoffRunId =
+              activeExecutionCleanupPending &&
+              activeExecutionRun.agentId !== agentId &&
+              issue.assigneeAgentId === agentId
+                ? activeExecutionRun.id
+                : null;
             const deferredPayload = {
               ...(payload ?? {}),
               issueId,
+              ...(cleanupHandoffRunId
+                ? { operatorCancellationCleanupHandoffRunId: cleanupHandoffRunId }
+                : {}),
               [DEFERRED_WAKE_CONTEXT_KEY]: enrichedContextSnapshot,
             };
 
@@ -18505,6 +18521,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 ...existingDeferredPayload,
                 ...(payload ?? {}),
                 issueId,
+                ...(cleanupHandoffRunId
+                  ? { operatorCancellationCleanupHandoffRunId: cleanupHandoffRunId }
+                  : {}),
                 [DEFERRED_WAKE_CONTEXT_KEY]: mergedDeferredContext,
               };
 

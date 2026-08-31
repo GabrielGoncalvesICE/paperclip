@@ -5149,6 +5149,18 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       runtimeConfig: {},
       permissions: {},
     });
+    const ineligiblePeerAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: ineligiblePeerAgentId,
+      companyId,
+      name: "UnmarkedPeerAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
     let adapterStarted: (() => void) | null = null;
     const adapterStartBarrier = new Promise<void>((resolve) => {
       adapterStarted = resolve;
@@ -5221,10 +5233,21 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .then((rows) => rows[0]?.executionRunId)).toBe(runId);
 
     const sameAgentDeferredWakeId = randomUUID();
+    const ineligiblePeerDeferredWakeId = randomUUID();
     await db.insert(agentWakeupRequests).values({
       id: sameAgentDeferredWakeId,
       companyId,
       agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_execution_deferred",
+      payload: { issueId },
+      status: "deferred_issue_execution",
+    });
+    await db.insert(agentWakeupRequests).values({
+      id: ineligiblePeerDeferredWakeId,
+      companyId,
+      agentId: ineligiblePeerAgentId,
       source: "automation",
       triggerDetail: "system",
       reason: "issue_execution_deferred",
@@ -5243,7 +5266,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       contextSnapshot: { issueId, wakeReason: "issue_assigned" },
     })).resolves.toBeNull();
     const peerWake = await db
-      .select({ id: agentWakeupRequests.id, status: agentWakeupRequests.status })
+      .select({
+        id: agentWakeupRequests.id,
+        status: agentWakeupRequests.status,
+        payload: agentWakeupRequests.payload,
+      })
       .from(agentWakeupRequests)
       .where(and(
         eq(agentWakeupRequests.agentId, peerAgentId),
@@ -5251,6 +5278,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       ))
       .then((rows) => rows[0]);
     expect(peerWake?.status).toBe("deferred_issue_execution");
+    expect(peerWake?.payload).toMatchObject({
+      operatorCancellationCleanupHandoffRunId: runId,
+    });
     expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
 
     runningProcesses.delete(runId);
@@ -5293,6 +5323,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.id, sameAgentDeferredWakeId))
       .then((rows) => rows[0])).toEqual({ status: "cancelled", runId: null });
+    expect(await db
+      .select({ status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, ineligiblePeerDeferredWakeId))
+      .then((rows) => rows[0])).toEqual({ status: "deferred_issue_execution", runId: null });
     const promotedPeerRunId = await db
       .select({ runId: agentWakeupRequests.runId })
       .from(agentWakeupRequests)
