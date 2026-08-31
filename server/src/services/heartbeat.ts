@@ -16386,6 +16386,40 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         | { dispatched: true; resultPromise: Promise<T> }
         | { dispatched: false }
       > => {
+        const queuedAsFollowupToRunId = readNonEmptyString(context.queuedAsFollowupToRunId);
+        if (issueId && queuedAsFollowupToRunId) {
+          return db.transaction(async (tx) => {
+            await tx
+              .select({ id: issues.id })
+              .from(issues)
+              .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
+              .for("update");
+            const currentRun = await tx
+              .select({ status: heartbeatRuns.status })
+              .from(heartbeatRuns)
+              .where(eq(heartbeatRuns.id, run.id))
+              .then((rows) => rows[0] ?? null);
+            if (currentRun?.status !== "running") {
+              await tx
+                .update(issues)
+                .set({
+                  executionRunId: null,
+                  executionAgentNameKey: null,
+                  executionLockedAt: null,
+                  updatedAt: new Date(),
+                })
+                .where(
+                  and(
+                    eq(issues.id, issueId),
+                    eq(issues.companyId, run.companyId),
+                    eq(issues.executionRunId, run.id),
+                  ),
+                );
+              return { dispatched: false as const };
+            }
+            return { dispatched: true as const, resultPromise: dispatch(() => {}) };
+          });
+        }
         if (!issueId || !isResolvedInteractionContinuationWakeContext(context)) {
           return { dispatched: true, resultPromise: dispatch(() => {}) };
         }
@@ -17072,6 +17106,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           },
           "skipping late run finalization because the run already left running state",
         );
+        if (
+          persistedRunWrite.run?.status === "cancelled" &&
+          persistedRunWrite.run.errorCode === "operator_cancelled_issue_run"
+        ) {
+          await db
+            .update(issues)
+            .set({
+              executionRunId: null,
+              executionAgentNameKey: null,
+              executionLockedAt: null,
+              updatedAt: new Date(),
+            })
+            .where(
+              and(
+                eq(issues.companyId, run.companyId),
+                eq(issues.executionRunId, run.id),
+              ),
+            );
+        }
         return;
       }
 
