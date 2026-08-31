@@ -19790,42 +19790,69 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     suppressDeferredPromotion?: boolean;
   };
 
-  async function cancelQueuedRunsForIssue(run: typeof heartbeatRuns.$inferSelect, issueId: string) {
-    const queuedRuns = await db
-      .update(heartbeatRuns)
-      .set({
-        status: "cancelled",
-        finishedAt: new Date(),
-        error: "Queued issue wake suppressed by operator cancellation",
-        errorCode: "operator_cancelled_issue_run",
-        updatedAt: new Date(),
-      })
-      .where(
-        and(
-          eq(heartbeatRuns.companyId, run.companyId),
-          eq(heartbeatRuns.agentId, run.agentId),
-          eq(heartbeatRuns.status, "queued"),
-          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
-          sql`${heartbeatRuns.id} <> ${run.id}`,
-        ),
-      )
-      .returning({ wakeupRequestId: heartbeatRuns.wakeupRequestId });
-
-    const wakeupRequestIds = queuedRuns
-      .map((queuedRun) => queuedRun.wakeupRequestId)
-      .filter((wakeupRequestId): wakeupRequestId is string => Boolean(wakeupRequestId));
-    if (wakeupRequestIds.length === 0) return;
-
+  async function cancelRunAndQueuedRunsForIssue(
+    run: typeof heartbeatRuns.$inferSelect,
+    issueId: string,
+    patch: Partial<typeof heartbeatRuns.$inferInsert>,
+  ) {
     const now = new Date();
-    await db
-      .update(agentWakeupRequests)
-      .set({
-        status: "cancelled",
-        finishedAt: now,
-        error: "Queued issue wake suppressed by operator cancellation",
-        updatedAt: now,
-      })
-      .where(inArray(agentWakeupRequests.id, wakeupRequestIds));
+    const cancelled = await db.transaction(async (tx) => {
+      const updated = await tx
+        .update(heartbeatRuns)
+        .set({ status: "cancelled", ...patch, updatedAt: now })
+        .where(eq(heartbeatRuns.id, run.id))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      if (!updated) return null;
+
+      const queuedRuns = await tx
+        .update(heartbeatRuns)
+        .set({
+          status: "cancelled",
+          finishedAt: now,
+          error: "Queued issue wake suppressed by operator cancellation",
+          errorCode: "operator_cancelled_issue_run",
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, run.companyId),
+            eq(heartbeatRuns.agentId, run.agentId),
+            eq(heartbeatRuns.status, "queued"),
+            sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+            sql`${heartbeatRuns.id} <> ${run.id}`,
+          ),
+        )
+        .returning({ wakeupRequestId: heartbeatRuns.wakeupRequestId });
+
+      const wakeupRequestIds = queuedRuns
+        .map((queuedRun) => queuedRun.wakeupRequestId)
+        .filter((wakeupRequestId): wakeupRequestId is string => Boolean(wakeupRequestId));
+      if (wakeupRequestIds.length > 0) {
+        await tx
+          .update(agentWakeupRequests)
+          .set({
+            status: "cancelled",
+            finishedAt: now,
+            error: "Queued issue wake suppressed by operator cancellation",
+            updatedAt: now,
+          })
+          .where(inArray(agentWakeupRequests.id, wakeupRequestIds));
+      }
+
+      return updated;
+    });
+
+    if (cancelled) {
+      clearHeartbeatRunRuntimeStatus(cancelled.id);
+      publishLiveEvent({
+        companyId: cancelled.companyId,
+        type: "heartbeat.run.status",
+        payload: buildHeartbeatRunStatusLiveEventPayload(cancelled),
+      });
+      publishRunLifecyclePluginEvent(cancelled);
+    }
+    return cancelled;
   }
 
   async function cancelRunInternal(runId: string, reason = "Cancelled by control plane", options: CancelRunOptions = {}) {
@@ -19864,12 +19891,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     const finishedAt = new Date();
-    const cancelled = await setRunStatus(run.id, "cancelled", {
+    const cancellationPatch = {
       finishedAt,
       error: reason,
       errorCode,
       ...(resultJson ? { resultJson } : {}),
-    });
+    };
+    const issueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
+    const cancelled = options.suppressDeferredPromotion && issueId
+      ? await cancelRunAndQueuedRunsForIssue(run, issueId, cancellationPatch)
+      : await setRunStatus(run.id, "cancelled", cancellationPatch);
 
     await setWakeupStatus(run.wakeupRequestId, "cancelled", {
       finishedAt,
@@ -19888,10 +19919,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         suppressImmediateRecovery: options.suppressImmediateRecovery,
         suppressDeferredPromotion: options.suppressDeferredPromotion,
       });
-      const issueId = readNonEmptyString(parseObject(cancelled.contextSnapshot).issueId);
-      if (options.suppressDeferredPromotion && issueId) {
-        await cancelQueuedRunsForIssue(cancelled, issueId);
-      }
     }
 
     await finalizeAgentStatus(run.agentId, "cancelled", undefined, {
