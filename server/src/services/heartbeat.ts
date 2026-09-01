@@ -20935,11 +20935,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const running = runningProcesses.get(run.id);
     let targetTerminationFailed = false;
     try {
-      if (running) {
+      if (running || (cancelled && targetHasPendingCleanup)) {
         await terminateHeartbeatRunProcess({
-          pid: running.child.pid,
-          processGroupId: running.processGroupId,
-          graceMs: Math.max(1, running.graceSec) * 1000,
+          pid: running?.child.pid ?? cancelled?.processPid,
+          processGroupId: running?.processGroupId ?? cancelled?.processGroupId,
+          ...(running ? { graceMs: Math.max(1, running.graceSec) * 1000 } : {}),
         });
       }
     } catch (err) {

@@ -5868,7 +5868,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(mockAdapterExecute.mock.calls.filter(([ctx]) => ctx?.runId === nextRunId)).toHaveLength(1);
   });
 
-  it("defers peer issue handoff until a failed target termination is reaped", async () => {
+  it("defers peer issue handoff until a persisted target is terminated after service map loss", async () => {
     const { companyId, agentId, issueId, runId, wakeupRequestId } = await seedRunFixture({
       agentStatus: "idle",
       runStatus: "queued",
@@ -5947,12 +5947,22 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const heartbeat = heartbeatService(db);
     await heartbeat.resumeQueuedRuns();
     await adapterStartBarrier;
+    await db
+      .update(heartbeatRuns)
+      .set({ processPid: 23456 })
+      .where(eq(heartbeatRuns.id, runId));
+    runningProcesses.delete(runId);
     const cancellation = heartbeat.cancelRun(runId, "Cancelled by a board operator", {
       suppressImmediateRecovery: true,
       suppressDeferredPromotion: true,
       resultJson: { cancelledByActorType: "user" },
     });
     await terminationStartBarrier;
+    expect(mockTerminateLocalService).toHaveBeenNthCalledWith(
+      1,
+      { pid: 23456, processGroupId: null },
+      undefined,
+    );
 
     expect(await heartbeat.getRun(runId)).toMatchObject({
       status: "cancelled",
