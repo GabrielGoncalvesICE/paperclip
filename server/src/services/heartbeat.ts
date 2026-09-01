@@ -20705,6 +20705,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const processGroupAlive = isProcessGroupAlive(run.processGroupId);
     if (!pidAlive && !processGroupAlive) return;
 
+    // A detached child's process group keeps its original PGID while any of
+    // its descendants remain alive. If the leader has exited, the missing PID
+    // cannot be identity-checked, but a matching persisted PID/PGID still names
+    // that extant group; terminate the descendants before releasing quarantine.
+    if (!pidAlive && processGroupAlive && run.processPid === run.processGroupId) {
+      await terminateHeartbeatRunProcess({
+        pid: run.processPid,
+        processGroupId: run.processGroupId,
+      });
+      return;
+    }
+
     const expectedStartedAt = run.processStartedAt?.getTime() ?? Number.NaN;
     if (!pidAlive || !run.processPid || !Number.isFinite(expectedStartedAt)) {
       throw new Error(`Cannot establish ownership of persisted process for cancelled run ${run.id}`);

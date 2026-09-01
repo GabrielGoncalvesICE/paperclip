@@ -5852,9 +5852,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     rejectTermination?.();
     await expect(cancellation).resolves.toMatchObject({ id: runId, status: "cancelled" });
 
-    mockTerminateLocalService.mockImplementationOnce(async () => {
-      releaseAdapter?.();
-    });
+    releaseAdapter?.();
+    await heartbeat.drainActiveRunExecutions();
     const reapResult = await restartedHeartbeat.reapOrphanedRuns();
     expect(reapResult.runIds).toContain(linkedRunId);
     await restartedHeartbeat.drainActiveRunExecutions();
@@ -6082,9 +6081,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     rejectTermination?.();
     await expect(cancellation).resolves.toMatchObject({ id: runId, status: "cancelled" });
-    mockTerminateLocalService.mockImplementationOnce(async () => {
-      releaseAdapter?.();
-    });
+    releaseAdapter?.();
+    await heartbeat.drainActiveRunExecutions();
     let peerAdapterStarted: (() => void) | null = null;
     const peerAdapterStartBarrier = new Promise<void>((resolve) => {
       peerAdapterStarted = resolve;
