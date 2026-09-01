@@ -326,6 +326,7 @@ import {
 } from "./heartbeat-run-runtime-status.js";
 import {
   findMissingHotRestartSnapshotRunIds,
+  readProcessStartedAt,
   readHotRestartIntent,
   removeHotRestartIntent,
   shouldHonorHotRestartIntentForProcess,
@@ -7044,6 +7045,8 @@ export interface HeartbeatServiceOptions {
   afterOperatorCancellationTerminationAcknowledged?: (input: {
     runId: string;
   }) => Promise<void>;
+  /** Test seam for persisted child-process identity checks. */
+  readProcessStartedAt?: (pid: number) => Promise<string | null>;
 }
 
 type WorkspaceReadyCommentWriter = {
@@ -7105,6 +7108,7 @@ export function resolveHeartbeatSchedulingSuppression(
 }
 
 export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) {
+  const readPersistedProcessStartedAt = options.readProcessStartedAt ?? readProcessStartedAt;
   const instanceSettings = instanceSettingsService(db);
   const getCurrentUserRedactionOptions = async () => ({
     enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
@@ -14352,13 +14356,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       let resultJson = parseObject(pendingRun.resultJson);
       if (resultJson.operatorCancellationTerminationAcknowledged !== true) {
         try {
-          if (running || pendingRun.processPid || pendingRun.processGroupId) {
-            await terminateHeartbeatRunProcess({
-              pid: running?.child.pid ?? pendingRun.processPid,
-              processGroupId: running?.processGroupId ?? pendingRun.processGroupId,
-              ...(running ? { graceMs: Math.max(1, running.graceSec) * 1000 } : {}),
-            });
-          }
+          await terminateOperatorCancellationProcess(pendingRun, running);
         } catch (err) {
           logger.warn(
             { err, runId: pendingRun.id },
@@ -20690,6 +20688,40 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     suppressDeferredPromotion?: boolean;
   };
 
+  async function terminateOperatorCancellationProcess(
+    run: typeof heartbeatRuns.$inferSelect,
+    running: (typeof runningProcesses extends Map<string, infer T> ? T : never) | undefined,
+  ) {
+    if (running) {
+      await terminateHeartbeatRunProcess({
+        pid: running.child.pid,
+        processGroupId: running.processGroupId,
+        graceMs: Math.max(1, running.graceSec) * 1000,
+      });
+      return;
+    }
+
+    const pidAlive = isProcessAlive(run.processPid);
+    const processGroupAlive = isProcessGroupAlive(run.processGroupId);
+    if (!pidAlive && !processGroupAlive) return;
+
+    const expectedStartedAt = run.processStartedAt?.getTime() ?? Number.NaN;
+    if (!pidAlive || !run.processPid || !Number.isFinite(expectedStartedAt)) {
+      throw new Error(`Cannot establish ownership of persisted process for cancelled run ${run.id}`);
+    }
+
+    const observedStartedAt = await readPersistedProcessStartedAt(run.processPid);
+    const observedStartedAtMs = observedStartedAt ? Date.parse(observedStartedAt) : Number.NaN;
+    if (!Number.isFinite(observedStartedAtMs) || observedStartedAtMs > expectedStartedAt) {
+      throw new Error(`Persisted PID no longer belongs to cancelled run ${run.id}`);
+    }
+
+    await terminateHeartbeatRunProcess({
+      pid: run.processPid,
+      processGroupId: run.processGroupId,
+    });
+  }
+
   async function clearOperatorCancellationCleanupMarkers(
     run: typeof heartbeatRuns.$inferSelect,
   ) {
@@ -20842,12 +20874,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const running = runningProcesses.get(successorRun.id);
       let terminationFailed = false;
       try {
-        if (running || successorRun.processPid || successorRun.processGroupId) {
-          await terminateHeartbeatRunProcess({
-            pid: running?.child.pid ?? successorRun.processPid,
-            processGroupId: running?.processGroupId ?? successorRun.processGroupId,
-            ...(running ? { graceMs: Math.max(1, running.graceSec) * 1000 } : {}),
-          });
+        if (parseObject(successorRun.resultJson).operatorCancellationTerminationPending === true) {
+          await terminateOperatorCancellationProcess(successorRun, running);
         }
       } catch (err) {
         terminationFailed = true;
@@ -20936,11 +20964,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     let targetTerminationFailed = false;
     try {
       if (running || (cancelled && targetHasPendingCleanup)) {
-        await terminateHeartbeatRunProcess({
-          pid: running?.child.pid ?? cancelled?.processPid,
-          processGroupId: running?.processGroupId ?? cancelled?.processGroupId,
-          ...(running ? { graceMs: Math.max(1, running.graceSec) * 1000 } : {}),
-        });
+        await terminateOperatorCancellationProcess(cancelled ?? run, running);
       }
     } catch (err) {
       if (!issueCancellation || !cancelled || !targetHasPendingCleanup) throw err;
