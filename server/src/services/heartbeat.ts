@@ -6717,6 +6717,37 @@ function isProcessAlive(pid: number | null | undefined) {
   }
 }
 
+async function linuxProcessGroupContainsRunIdentity(processGroupId: number, runId: string) {
+  if (process.platform !== "linux") return false;
+
+  let entries: Array<{ isDirectory: () => boolean; name: string }>;
+  try {
+    entries = await fs.readdir("/proc", { withFileTypes: true });
+  } catch {
+    return false;
+  }
+
+  const expectedRunIdentity = `PAPERCLIP_RUN_ID=${runId}`;
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !/^\d+$/.test(entry.name)) continue;
+    try {
+      const stat = await fs.readFile(`/proc/${entry.name}/stat`, "utf8");
+      const commandEnd = stat.lastIndexOf(")");
+      if (commandEnd < 0) continue;
+      const fields = stat.slice(commandEnd + 1).trim().split(/\s+/);
+      const memberProcessGroupId = Number.parseInt(fields[2] ?? "", 10);
+      if (memberProcessGroupId !== processGroupId) continue;
+
+      const environment = await fs.readFile(`/proc/${entry.name}/environ`, "utf8");
+      if (environment.split("\0").includes(expectedRunIdentity)) return true;
+    } catch {
+      // The process can exit, or deny inspection, while /proc is scanned.
+    }
+  }
+
+  return false;
+}
+
 async function terminateHeartbeatRunProcess(input: {
   pid: number | null | undefined;
   processGroupId: number | null | undefined;
@@ -20706,10 +20737,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (!pidAlive && !processGroupAlive) return;
 
     // A detached child's process group keeps its original PGID while any of
-    // its descendants remain alive. If the leader has exited, the missing PID
-    // cannot be identity-checked, but a matching persisted PID/PGID still names
-    // that extant group; terminate the descendants before releasing quarantine.
-    if (!pidAlive && processGroupAlive && run.processPid === run.processGroupId) {
+    // its descendants remain alive. The missing leader cannot prove ownership,
+    // because the OS may later recycle both its PID and PGID, so require the
+    // per-run identity injected into local adapter environments before signaling.
+    const processGroupId = run.processGroupId;
+    if (!pidAlive && processGroupAlive && processGroupId && run.processPid === processGroupId) {
+      if (!(await linuxProcessGroupContainsRunIdentity(processGroupId, run.id))) {
+        throw new Error(`Persisted process group no longer belongs to cancelled run ${run.id}`);
+      }
       await terminateHeartbeatRunProcess({
         pid: run.processPid,
         processGroupId: run.processGroupId,

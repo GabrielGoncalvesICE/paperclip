@@ -265,7 +265,7 @@ async function cancelActiveRunsForCleanup(
   }
 }
 
-async function spawnOrphanedProcessGroup() {
+async function spawnOrphanedProcessGroup(env?: NodeJS.ProcessEnv) {
   const leader = spawn(
     process.execPath,
     [
@@ -279,6 +279,7 @@ async function spawnOrphanedProcessGroup() {
     ],
     {
       detached: true,
+      env: { ...process.env, ...env },
       stdio: ["ignore", "pipe", "ignore"],
     },
   );
@@ -5911,6 +5912,82 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect((await heartbeat.getRun(runId))?.resultJson).toEqual(expect.objectContaining({
       operatorCancellationTerminationPending: true,
     }));
+  });
+
+  it.skipIf(process.platform !== "linux")("reaps cancellation descendants that retain the run identity", async () => {
+    const { issueId, runId } = await seedRunFixture({
+      agentStatus: "running",
+      includeIssue: true,
+    });
+    const orphan = await spawnOrphanedProcessGroup({ PAPERCLIP_RUN_ID: runId });
+    cleanupPids.add(orphan.descendantPid);
+    expect(isPidAlive(orphan.descendantPid)).toBe(true);
+    await db
+      .update(heartbeatRuns)
+      .set({
+        processPid: orphan.processPid,
+        processGroupId: orphan.processGroupId,
+        processStartedAt: new Date(),
+      })
+      .where(eq(heartbeatRuns.id, runId));
+
+    const heartbeat = heartbeatService(db);
+    await expect(heartbeat.cancelRun(runId, "Cancelled by a board operator", {
+      suppressImmediateRecovery: true,
+      suppressDeferredPromotion: true,
+      resultJson: { cancelledByActorType: "user" },
+    })).resolves.toMatchObject({ id: runId, status: "cancelled" });
+
+    expect(isPidAlive(orphan.descendantPid)).toBe(false);
+    expect(mockTerminateLocalService).toHaveBeenCalledTimes(1);
+    expect(await db
+      .select({ executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]?.executionRunId)).toBeNull();
+    expect((await heartbeat.getRun(runId))?.resultJson).not.toEqual(expect.objectContaining({
+      operatorCancellationTerminationPending: true,
+    }));
+  });
+
+  it.skipIf(process.platform !== "linux")("keeps cancellation quarantined for an unowned recycled process group", async () => {
+    const { issueId, runId } = await seedRunFixture({
+      agentStatus: "running",
+      includeIssue: true,
+    });
+    const orphan = await spawnOrphanedProcessGroup({ PAPERCLIP_RUN_ID: randomUUID() });
+    cleanupPids.add(orphan.descendantPid);
+    expect(isPidAlive(orphan.descendantPid)).toBe(true);
+    await db
+      .update(heartbeatRuns)
+      .set({
+        processPid: orphan.processPid,
+        processGroupId: orphan.processGroupId,
+        processStartedAt: new Date(),
+      })
+      .where(eq(heartbeatRuns.id, runId));
+
+    const heartbeat = heartbeatService(db);
+    await expect(heartbeat.cancelRun(runId, "Cancelled by a board operator", {
+      suppressImmediateRecovery: true,
+      suppressDeferredPromotion: true,
+      resultJson: { cancelledByActorType: "user" },
+    })).resolves.toMatchObject({
+      id: runId,
+      status: "cancelled",
+      resultJson: expect.objectContaining({
+        operatorCancellationTerminationPending: true,
+      }),
+    });
+
+    expect(isPidAlive(orphan.descendantPid)).toBe(true);
+    expect(mockTerminateLocalService).not.toHaveBeenCalled();
+    expect((await heartbeat.reapOrphanedRuns()).runIds).not.toContain(runId);
+    expect(await db
+      .select({ executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]?.executionRunId)).toBe(runId);
   });
 
   it("defers peer issue handoff until a failed target termination is reaped", async () => {
